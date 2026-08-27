@@ -11,7 +11,9 @@
 
 #include "sensor_coverage_planner/sensor_coverage_planner_ground.h"
 #include "graph/graph.h"
+#include <algorithm>
 #include <memory>
+#include <pcl/common/point_tests.h>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
 
@@ -62,6 +64,7 @@ void SensorCoveragePlanner3D::ReadParameters() {
   this->declare_parameter<bool>("kUseLineOfSightLookAheadPoint", true);
   this->declare_parameter<bool>("kNoExplorationReturnHome", true);
   this->declare_parameter<bool>("kUseMomentum", false);
+  this->declare_parameter<bool>("kUseFrontier", true);
 
   // Double
   this->declare_parameter<double>("kKeyposeCloudDwzFilterLeafSize", 0.2);
@@ -512,6 +515,16 @@ void SensorCoveragePlanner3D::RegisteredScanCallback(
   pcl::PointCloud<pcl::PointXYZ>::Ptr registered_scan_tmp(
       new pcl::PointCloud<pcl::PointXYZ>());
   pcl::fromROSMsg(*registered_scan_msg, *registered_scan_tmp);
+  registered_scan_tmp->points.erase(
+      std::remove_if(registered_scan_tmp->points.begin(),
+                     registered_scan_tmp->points.end(),
+                     [](const pcl::PointXYZ &point) {
+                       return !pcl::isFinite(point);
+                     }),
+      registered_scan_tmp->points.end());
+  registered_scan_tmp->width = registered_scan_tmp->points.size();
+  registered_scan_tmp->height = 1;
+  registered_scan_tmp->is_dense = true;
   if (registered_scan_tmp->points.empty()) {
     return;
   }

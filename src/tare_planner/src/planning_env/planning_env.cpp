@@ -170,6 +170,8 @@ void PlanningEnv::UpdateFrontiers()
   {
     prev_robot_position_ = robot_position_;
     rolling_occupancy_grid_->GetFrontier(frontier_cloud_->cloud_, robot_position_, parameters_.kExtractFrontierRange);
+    frontier_cloud_->Publish();
+    filtered_frontier_cloud_->cloud_->clear();
 
     if (!frontier_cloud_->cloud_->points.empty())
     {
@@ -215,8 +217,8 @@ void PlanningEnv::UpdateFrontiers()
       extract.setIndices(inliers);
       extract.setNegative(false);
       extract.filter(*(filtered_frontier_cloud_->cloud_));
-      filtered_frontier_cloud_->Publish();
     }
+    filtered_frontier_cloud_->Publish();
   }
 }
 
