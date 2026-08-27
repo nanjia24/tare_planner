@@ -13,7 +13,8 @@
 
 namespace tare_visualizer_ns
 {
-TAREVisualizer::TAREVisualizer(rclcpp::Node::SharedPtr nh)
+TAREVisualizer::TAREVisualizer(rclcpp::Node::SharedPtr nh, const std::string& world_frame_id)
+  : world_frame_id_(world_frame_id)
 {
   ReadParameters(nh);
 
@@ -21,16 +22,17 @@ TAREVisualizer::TAREVisualizer(rclcpp::Node::SharedPtr nh)
   local_path_publisher_ = nh->create_publisher<nav_msgs::msg::Path>("tare_visualizer/local_path", 1);
 
   global_subspaces_marker_ =
-      std::make_shared<misc_utils_ns::Marker>(nh, "tare_visualizer/exploring_subspaces", kWorldFrameID);
+      std::make_shared<misc_utils_ns::Marker>(nh, "tare_visualizer/exploring_subspaces", world_frame_id_);
   local_planning_horizon_marker_ =
-      std::make_shared<misc_utils_ns::Marker>(nh, "tare_visualizer/local_planning_horizon", kWorldFrameID);
+      std::make_shared<misc_utils_ns::Marker>(nh, "tare_visualizer/local_planning_horizon", world_frame_id_);
 
   uncovered_surface_point_cloud_ = std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-      nh, "tare_visualizer/uncovered_surface_points", kWorldFrameID);
+      nh, "tare_visualizer/uncovered_surface_points", world_frame_id_);
   viewpoint_candidate_cloud_ = std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-      nh, "tare_visualizer/viewpoint_candidates", kWorldFrameID);
+      nh, "tare_visualizer/viewpoint_candidates", world_frame_id_);
   viewpoint_cloud_ =
-      std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(nh, "tare_visualizer/viewpoints", kWorldFrameID);
+      std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
+          nh, "tare_visualizer/viewpoints", world_frame_id_);
 
   InitializeMarkers();
 }

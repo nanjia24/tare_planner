@@ -27,7 +27,7 @@ namespace tare_visualizer_ns
 class TAREVisualizer
 {
 public:
-  explicit TAREVisualizer(rclcpp::Node::SharedPtr nh);
+  TAREVisualizer(rclcpp::Node::SharedPtr nh, const std::string& world_frame_id);
   bool ReadParameters(rclcpp::Node::SharedPtr nh);
 
   void InitializeMarkers();
@@ -37,7 +37,7 @@ public:
   void PublishMarkers();
 
 private:
-  const std::string kWorldFrameID = "map";
+  std::string world_frame_id_;
   bool kExploringSubspaceMarkerColorGradientAlpha;
   double kExploringSubspaceMarkerColorMaxAlpha;
   std_msgs::msg::ColorRGBA kExploringSubspaceMarkerColor;

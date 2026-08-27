@@ -59,7 +59,6 @@
 #define curshome "\033[0;0H"
 
 namespace sensor_coverage_planner_3d_ns {
-const std::string kWorldFrameID = "map";
 typedef pcl::PointXYZRGBNormal PlannerCloudPointType;
 typedef pcl::PointCloud<PlannerCloudPointType> PlannerCloudType;
 typedef misc_utils_ns::Timer Timer;
@@ -74,6 +73,7 @@ public:
 private:
   // Parameters
   // String
+  std::string world_frame_id_ = "map";
   std::string sub_start_exploration_topic_;
   std::string sub_keypose_topic_;
   std::string sub_state_estimation_topic_;

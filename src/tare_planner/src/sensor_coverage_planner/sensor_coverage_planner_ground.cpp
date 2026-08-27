@@ -24,6 +24,7 @@ namespace sensor_coverage_planner_3d_ns {
 
 // bool PlannerParameters::ReadParameters(rclcpp::Node::SharedPtr node_)
 void SensorCoveragePlanner3D::ReadParameters() {
+  this->declare_parameter<std::string>("world_frame", "map");
   this->declare_parameter<std::string>("sub_start_exploration_topic_",
                                        "/exploration_start");
   this->declare_parameter<std::string>("sub_state_estimation_topic_",
@@ -177,6 +178,7 @@ void SensorCoveragePlanner3D::ReadParameters() {
   this->declare_parameter<double>("kLocalPlanningHorizonHeight", 3.0);
 
   bool got_parameter = true;
+  this->get_parameter("world_frame", world_frame_id_);
   got_parameter &= this->get_parameter("sub_start_exploration_topic_",
                                        sub_start_exploration_topic_);
   if (!got_parameter) {
@@ -242,63 +244,63 @@ void SensorCoveragePlanner3D::ReadParameters() {
 void SensorCoveragePlanner3D::InitializeData() {
   keypose_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<PlannerCloudPointType>>(
-          shared_from_this(), "keypose_cloud", kWorldFrameID);
+          shared_from_this(), "keypose_cloud", world_frame_id_);
   registered_scan_stack_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZ>>(
-          shared_from_this(), "registered_scan_stack", kWorldFrameID);
+          shared_from_this(), "registered_scan_stack", world_frame_id_);
   registered_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "registered_cloud", kWorldFrameID);
+          shared_from_this(), "registered_cloud", world_frame_id_);
   large_terrain_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "terrain_cloud_large", kWorldFrameID);
+          shared_from_this(), "terrain_cloud_large", world_frame_id_);
   terrain_collision_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "terrain_collision_cloud", kWorldFrameID);
+          shared_from_this(), "terrain_collision_cloud", world_frame_id_);
   terrain_ext_collision_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "terrain_ext_collision_cloud", kWorldFrameID);
+          shared_from_this(), "terrain_ext_collision_cloud", world_frame_id_);
   viewpoint_vis_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "viewpoint_vis_cloud", kWorldFrameID);
+          shared_from_this(), "viewpoint_vis_cloud", world_frame_id_);
   grid_world_vis_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "grid_world_vis_cloud", kWorldFrameID);
+          shared_from_this(), "grid_world_vis_cloud", world_frame_id_);
   exploration_path_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "bspline_path_cloud", kWorldFrameID);
+          shared_from_this(), "bspline_path_cloud", world_frame_id_);
 
   selected_viewpoint_vis_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "selected_viewpoint_vis_cloud", kWorldFrameID);
+          shared_from_this(), "selected_viewpoint_vis_cloud", world_frame_id_);
   exploring_cell_vis_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "exploring_cell_vis_cloud", kWorldFrameID);
+          shared_from_this(), "exploring_cell_vis_cloud", world_frame_id_);
   collision_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "collision_cloud", kWorldFrameID);
+          shared_from_this(), "collision_cloud", world_frame_id_);
   lookahead_point_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "lookahead_point_cloud", kWorldFrameID);
+          shared_from_this(), "lookahead_point_cloud", world_frame_id_);
   keypose_graph_vis_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "keypose_graph_cloud", kWorldFrameID);
+          shared_from_this(), "keypose_graph_cloud", world_frame_id_);
   viewpoint_in_collision_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "viewpoint_in_collision_cloud_", kWorldFrameID);
+          shared_from_this(), "viewpoint_in_collision_cloud_", world_frame_id_);
   point_cloud_manager_neighbor_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "pointcloud_manager_cloud", kWorldFrameID);
+          shared_from_this(), "pointcloud_manager_cloud", world_frame_id_);
   reordered_global_subspace_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "reordered_global_subspace_cloud", kWorldFrameID);
+          shared_from_this(), "reordered_global_subspace_cloud", world_frame_id_);
 
   viewpoint_manager_ = std::make_shared<viewpoint_manager_ns::ViewPointManager>(
       shared_from_this());
   keypose_graph_ =
       std::make_shared<keypose_graph_ns::KeyposeGraph>(shared_from_this());
-  planning_env_ =
-      std::make_shared<planning_env_ns::PlanningEnv>(shared_from_this());
+  planning_env_ = std::make_shared<planning_env_ns::PlanningEnv>(
+      shared_from_this(), world_frame_id_);
   grid_world_ = std::make_shared<grid_world_ns::GridWorld>(shared_from_this());
   grid_world_->SetUseKeyposeGraph(true);
   local_coverage_planner_ =
@@ -306,8 +308,8 @@ void SensorCoveragePlanner3D::InitializeData() {
           shared_from_this());
   local_coverage_planner_->SetViewPointManager(viewpoint_manager_);
 
-  visualizer_ =
-      std::make_shared<tare_visualizer_ns::TAREVisualizer>(shared_from_this());
+  visualizer_ = std::make_shared<tare_visualizer_ns::TAREVisualizer>(
+      shared_from_this(), world_frame_id_);
 
   initial_position_.x() = 0.0;
   initial_position_.y() = 0.0;
@@ -316,25 +318,25 @@ void SensorCoveragePlanner3D::InitializeData() {
   cur_keypose_node_ind_ = 0;
 
   keypose_graph_node_marker_ = std::make_shared<misc_utils_ns::Marker>(
-      shared_from_this(), "keypose_graph_node_marker", kWorldFrameID);
+      shared_from_this(), "keypose_graph_node_marker", world_frame_id_);
   keypose_graph_node_marker_->SetType(visualization_msgs::msg::Marker::POINTS);
   keypose_graph_node_marker_->SetScale(0.4, 0.4, 0.1);
   keypose_graph_node_marker_->SetColorRGBA(1.0, 0.0, 0.0, 1.0);
   keypose_graph_edge_marker_ = std::make_shared<misc_utils_ns::Marker>(
-      shared_from_this(), "keypose_graph_edge_marker", kWorldFrameID);
+      shared_from_this(), "keypose_graph_edge_marker", world_frame_id_);
   keypose_graph_edge_marker_->SetType(
       visualization_msgs::msg::Marker::LINE_LIST);
   keypose_graph_edge_marker_->SetScale(0.05, 0.0, 0.0);
   keypose_graph_edge_marker_->SetColorRGBA(1.0, 1.0, 0.0, 0.9);
 
   nogo_boundary_marker_ = std::make_shared<misc_utils_ns::Marker>(
-      shared_from_this(), "nogo_boundary_marker", kWorldFrameID);
+      shared_from_this(), "nogo_boundary_marker", world_frame_id_);
   nogo_boundary_marker_->SetType(visualization_msgs::msg::Marker::LINE_LIST);
   nogo_boundary_marker_->SetScale(0.05, 0.0, 0.0);
   nogo_boundary_marker_->SetColorRGBA(1.0, 0.0, 0.0, 0.8);
 
   grid_world_marker_ = std::make_shared<misc_utils_ns::Marker>(
-      shared_from_this(), "grid_world_marker", kWorldFrameID);
+      shared_from_this(), "grid_world_marker", world_frame_id_);
   grid_world_marker_->SetType(visualization_msgs::msg::Marker::CUBE_LIST);
   grid_world_marker_->SetScale(1.0, 1.0, 1.0);
   grid_world_marker_->SetColorRGBA(1.0, 0.0, 0.0, 0.8);
@@ -644,7 +646,7 @@ void SensorCoveragePlanner3D::JoystickCallback(
 
       // Set waypoint to the current robot position to stop the robot in place
       geometry_msgs::msg::PointStamped waypoint;
-      waypoint.header.frame_id = "map";
+      waypoint.header.frame_id = world_frame_id_;
       waypoint.header.stamp = this->now();
       waypoint.point.x = robot_position_.x;
       waypoint.point.y = robot_position_.y;
@@ -663,7 +665,7 @@ void SensorCoveragePlanner3D::ResetWaypointCallback(
 
   // Set waypoint to the current robot position to stop the robot in place
   geometry_msgs::msg::PointStamped waypoint;
-  waypoint.header.frame_id = "map";
+  waypoint.header.frame_id = world_frame_id_;
   waypoint.header.stamp = this->now();
   waypoint.point.x = robot_position_.x;
   waypoint.point.y = robot_position_.y;
@@ -680,7 +682,7 @@ void SensorCoveragePlanner3D::SendInitialWaypoint() {
   double dy = sin(robot_yaw_) * lx + cos(robot_yaw_) * ly;
 
   geometry_msgs::msg::PointStamped waypoint;
-  waypoint.header.frame_id = "map";
+  waypoint.header.frame_id = world_frame_id_;
   waypoint.header.stamp = this->now();
   waypoint.point.x = robot_position_.x + dx;
   waypoint.point.y = robot_position_.y + dy;
@@ -825,7 +827,8 @@ void SensorCoveragePlanner3D::UpdateGlobalRepresentation() {
       planning_env_->GetPointCloudManagerNeighborCellsOrigin();
   geometry_msgs::msg::PointStamped
       pointcloud_manager_neighbor_cells_origin_point;
-  pointcloud_manager_neighbor_cells_origin_point.header.frame_id = "map";
+  pointcloud_manager_neighbor_cells_origin_point.header.frame_id =
+      world_frame_id_;
   pointcloud_manager_neighbor_cells_origin_point.header.stamp = this->now();
   pointcloud_manager_neighbor_cells_origin_point.point.x =
       pointcloud_manager_neighbor_cells_origin.x();
@@ -877,7 +880,7 @@ void SensorCoveragePlanner3D::PublishGlobalPlanningVisualization(
     const exploration_path_ns::ExplorationPath &global_path,
     const exploration_path_ns::ExplorationPath &local_path) {
   nav_msgs::msg::Path global_path_full = global_path.GetPath();
-  global_path_full.header.frame_id = "map";
+  global_path_full.header.frame_id = world_frame_id_;
   global_path_full.header.stamp = this->now();
   global_path_full_publisher_->publish(global_path_full);
   // Get the part that connects with the local path
@@ -929,7 +932,7 @@ void SensorCoveragePlanner3D::PublishGlobalPlanningVisualization(
     last_pose.pose.position.z = local_path.nodes_.back().position_.z();
     global_path_trim.poses.push_back(last_pose);
   }
-  global_path_trim.header.frame_id = "map";
+  global_path_trim.header.frame_id = world_frame_id_;
   global_path_trim.header.stamp = this->now();
   global_path_publisher_->publish(global_path_trim);
 
@@ -938,7 +941,7 @@ void SensorCoveragePlanner3D::PublishGlobalPlanningVisualization(
   grid_world_->GetMarker(grid_world_marker_->marker_);
   grid_world_marker_->Publish();
   nav_msgs::msg::Path full_path = exploration_path_.GetPath();
-  full_path.header.frame_id = "map";
+  full_path.header.frame_id = world_frame_id_;
   full_path.header.stamp = this->now();
   // exploration_path_publisher_->publish(full_path);
   exploration_path_.GetVisualizationCloud(exploration_path_cloud_->cloud_);
@@ -966,7 +969,7 @@ void SensorCoveragePlanner3D::PublishLocalPlanningVisualization(
   viewpoint_vis_cloud_->Publish();
   lookahead_point_cloud_->Publish();
   nav_msgs::msg::Path local_tsp_path = local_path.GetPath();
-  local_tsp_path.header.frame_id = "map";
+  local_tsp_path.header.frame_id = world_frame_id_;
   local_tsp_path.header.stamp = this->now();
   local_tsp_path_publisher_->publish(local_tsp_path);
   local_coverage_planner_->GetSelectedViewPointVisCloud(
@@ -1368,7 +1371,7 @@ void SensorCoveragePlanner3D::PublishWaypoint() {
     waypoint.point.z = lookahead_point_.z();
   }
   misc_utils_ns::Publish(shared_from_this(), waypoint_pub_, waypoint,
-                         kWorldFrameID);
+                         world_frame_id_);
 }
 
 void SensorCoveragePlanner3D::PublishRuntime() {
