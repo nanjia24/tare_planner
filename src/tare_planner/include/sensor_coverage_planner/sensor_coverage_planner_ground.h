@@ -30,6 +30,7 @@
 #include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/int32_multi_array.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <tf2/transform_datatypes.h>
 // PCL
 #include <pcl/PointIndices.h>
@@ -90,6 +91,8 @@ private:
   std::string pub_runtime_breakdown_topic_;
   std::string pub_runtime_topic_;
   std::string pub_waypoint_topic_;
+  std::string pub_execution_reference_path_topic_;
+  std::string pub_execution_reference_status_topic_;
   std::string pub_momentum_activation_count_topic_;
 
   // Bool
@@ -110,6 +113,7 @@ private:
   double kLookAheadDistance;
   double kExtendWayPointDistanceBig;
   double kExtendWayPointDistanceSmall;
+  double kExecutionReferenceShortcutMaxDistance;
 
   // Int
   int kDirectionChangeCounterThr;
@@ -193,6 +197,8 @@ private:
   bool use_momentum_;
   bool lookahead_point_in_line_of_sight_;
   bool reset_waypoint_;
+  bool execution_reference_selection_valid_{false};
+  bool execution_reference_uses_global_path_{false};
   pointcloud_utils_ns::PointCloudDownsizer<pcl::PointXYZ> pointcloud_downsizer_;
 
   int update_representation_runtime_;
@@ -206,6 +212,9 @@ private:
   int direction_change_count_;
   int direction_no_change_count_;
   int momentum_activation_count_;
+  int execution_reference_robot_index_{-1};
+  int execution_reference_target_index_{-1};
+  int execution_reference_direction_step_{0};
 
   double start_time_;
   double global_direction_switch_time_;
@@ -240,7 +249,11 @@ private:
       to_nearest_global_subspace_path_publisher_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr local_tsp_path_publisher_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr exploration_path_publisher_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr
+      execution_reference_path_publisher_;
   rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr waypoint_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr
+      execution_reference_status_publisher_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr exploration_finish_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr
       runtime_breakdown_pub_;
@@ -302,6 +315,9 @@ private:
   double GetRobotToHomeDistance();
   void PublishExplorationState();
   void PublishWaypoint();
+  void PublishExecutionReferencePath(
+      const exploration_path_ns::ExplorationPath &local_path,
+      const exploration_path_ns::ExplorationPath &global_path);
   bool
   GetLookAheadPoint(const exploration_path_ns::ExplorationPath &local_path,
                     const exploration_path_ns::ExplorationPath &global_path,

@@ -146,6 +146,14 @@ add_executable(tare_planner_node src/tare_planner_node/tare_planner_node.cpp)
 ament_target_dependencies(tare_planner_node rclcpp std_msgs nav_msgs geometry_msgs sensor_msgs tf2_ros tf2_geometry_msgs tf2)
 target_link_libraries(tare_planner_node ${catkin_LIBRARIES} sensor_coverage_planner_ground)
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_collision_geometry test/test_collision_geometry.cpp)
+  ament_add_gtest(
+    test_execution_reference_shortcut
+    test/test_execution_reference_shortcut.cpp)
+endif()
+
 #############
 ## Install ##
 #############
@@ -169,5 +177,3 @@ install(DIRECTORY data/
       )
 
 ament_package()
-
-

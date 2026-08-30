@@ -274,6 +274,10 @@ bool GridWorld::AreNeighbors(int cell_ind1, int cell_ind2)
 
 int GridWorld::GetCellInd(double qx, double qy, double qz)
 {
+  if (kLevelNum == 1)
+  {
+    qz = origin_.z + kCellHeight / 2.0;
+  }
   Eigen::Vector3i sub = subspaces_->Pos2Sub(qx, qy, qz);
   if (subspaces_->InRange(sub))
   {
@@ -561,17 +565,18 @@ void GridWorld::UpdateCellStatus(const std::shared_ptr<viewpoint_manager_ns::Vie
   for (const auto& viewpoint_ind : viewpoint_manager->candidate_indices_)
   {
     geometry_msgs::msg::Point viewpoint_position = viewpoint_manager->GetViewPointPosition(viewpoint_ind);
-    Eigen::Vector3i sub =
-        subspaces_->Pos2Sub(Eigen::Vector3d(viewpoint_position.x, viewpoint_position.y, viewpoint_position.z));
-    if (subspaces_->InRange(sub))
+    int cell_ind = GetCellInd(viewpoint_position.x, viewpoint_position.y, viewpoint_position.z);
+    if (subspaces_->InRange(cell_ind))
     {
-      int cell_ind = subspaces_->Sub2Ind(sub);
       AddViewPointToCell(cell_ind, viewpoint_ind);
       viewpoint_manager->SetViewPointCellInd(viewpoint_ind, cell_ind);
     }
     else
     {
-      RCLCPP_ERROR_STREAM(rclcpp::get_logger("standalone_logger"), "subspace sub out of bound: " << sub.transpose());
+      RCLCPP_ERROR_STREAM(rclcpp::get_logger("standalone_logger"),
+                          "viewpoint position out of grid world: " << viewpoint_position.x << " "
+                                                                   << viewpoint_position.y << " "
+                                                                   << viewpoint_position.z);
     }
   }
 

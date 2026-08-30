@@ -9,6 +9,7 @@
  *
  */
 #include "viewpoint_manager/viewpoint_manager.h"
+#include "viewpoint_manager/collision_geometry.h"
 
 namespace viewpoint_manager_ns
 {
@@ -224,6 +225,9 @@ void ViewPointManager::GetCollisionCorrespondence()
   kdtree->setInputCloud(viewpoint_cloud);
   std::vector<int> nearby_viewpoint_indices;
   std::vector<float> nearby_viewpoint_sqdist;
+  const double association_radius = ConservativeAssociationRadiusXY(
+      vp_.kViewPointCollisionMargin, vp_.kCollisionGridResolution.x(),
+      vp_.kCollisionGridResolution.y());
   int count = 0;
   for (int x = 0; x < vp_.kCollisionGridSize.x(); x++)
   {
@@ -237,7 +241,8 @@ void ViewPointManager::GetCollisionCorrespondence()
         query_point.y = query_point_position.y();
         query_point.z = query_point_position.z();
         query_point.z *= vp_.kCollisionGridZScale;
-        kdtree->radiusSearch(query_point, vp_.kViewPointCollisionMargin, nearby_viewpoint_indices,
+        kdtree->radiusSearch(query_point, association_radius,
+                             nearby_viewpoint_indices,
                              nearby_viewpoint_sqdist);
         int grid_ind = collision_grid_->Sub2Ind(x, y, z);
         for (int i = 0; i < nearby_viewpoint_indices.size(); i++)
@@ -435,6 +440,14 @@ void ViewPointManager::CheckViewPointCollisionWithCollisionGrid(
         {
           int viewpoint_ind = collision_viewpoint_indices[i];
           MY_ASSERT(viewpoint_ind >= 0 && viewpoint_ind < vp_.kViewPointNumber);
+          geometry_msgs::msg::Point viewpoint_position =
+              GetViewPointPosition(viewpoint_ind);
+          if (!WithinHorizontalEnvelope(
+                  point.x, point.y, viewpoint_position.x,
+                  viewpoint_position.y, vp_.kViewPointCollisionMargin))
+          {
+            continue;
+          }
           double z_diff = point.z - GetViewPointHeight(viewpoint_ind);
           if ((z_diff >= 0 && z_diff <= vp_.kViewPointCollisionMarginZPlus) ||
               (z_diff < 0 && z_diff >= -vp_.kViewPointCollisionMarginZMinus))
@@ -1412,6 +1425,7 @@ void ViewPointManager::GetCandidateViewPointGraph(std::vector<std::vector<int>>&
   for (int i = 0; i < candidate_indices_.size(); i++)
   {
     int cur_ind = candidate_indices_[i];
+    const Eigen::Vector3i cur_sub = grid_->Ind2Sub(cur_ind);
     positions.push_back(GetViewPointPosition(cur_ind));
     for (int j = 0; j < connected_neighbor_indices_[cur_ind].size(); j++)
     {
@@ -1419,6 +1433,26 @@ void ViewPointManager::GetCandidateViewPointGraph(std::vector<std::vector<int>>&
       double neighbor_dist = connected_neighbor_dist_[cur_ind][j];
       if (IsViewPointCandidate(neighbor_ind))
       {
+        const Eigen::Vector3i neighbor_sub = grid_->Ind2Sub(neighbor_ind);
+        const Eigen::Vector3i delta = neighbor_sub - cur_sub;
+        if (std::abs(delta.x()) == 1 && std::abs(delta.y()) == 1)
+        {
+          const Eigen::Vector3i x_side_sub(
+              cur_sub.x() + delta.x(), cur_sub.y(), cur_sub.z());
+          const Eigen::Vector3i y_side_sub(
+              cur_sub.x(), cur_sub.y() + delta.y(), cur_sub.z());
+          const bool x_side_clear =
+              grid_->InRange(x_side_sub) &&
+              IsViewPointCandidate(grid_->Sub2Ind(x_side_sub));
+          const bool y_side_clear =
+              grid_->InRange(y_side_sub) &&
+              IsViewPointCandidate(grid_->Sub2Ind(y_side_sub));
+          if (!DiagonalTransitionIsClear(
+                  delta.x(), delta.y(), x_side_clear, y_side_clear))
+          {
+            continue;
+          }
+        }
         graph[i].push_back(graph_index_map_[neighbor_ind]);
         dist[i].push_back(neighbor_dist);
       }

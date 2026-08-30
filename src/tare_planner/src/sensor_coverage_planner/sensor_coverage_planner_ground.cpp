@@ -11,9 +11,11 @@
 
 #include "sensor_coverage_planner/sensor_coverage_planner_ground.h"
 #include "graph/graph.h"
+#include "sensor_coverage_planner/execution_reference_shortcut.h"
 #include <algorithm>
 #include <memory>
 #include <pcl/common/point_tests.h>
+#include <sstream>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
 
@@ -52,6 +54,10 @@ void SensorCoveragePlanner3D::ReadParameters() {
                                        "runtime_breakdown");
   this->declare_parameter<std::string>("pub_runtime_topic_", "/runtime");
   this->declare_parameter<std::string>("pub_waypoint_topic_", "/way_point");
+  this->declare_parameter<std::string>("pub_execution_reference_path_topic_",
+                                       "/tare/execution_reference_path");
+  this->declare_parameter<std::string>("pub_execution_reference_status_topic_",
+                                       "/tare/execution_reference_status");
   this->declare_parameter<std::string>("pub_momentum_activation_count_topic_",
                                        "momentum_activation_count");
 
@@ -74,6 +80,8 @@ void SensorCoveragePlanner3D::ReadParameters() {
   this->declare_parameter<double>("kLookAheadDistance", 5.0);
   this->declare_parameter<double>("kExtendWayPointDistanceBig", 8.0);
   this->declare_parameter<double>("kExtendWayPointDistanceSmall", 3.0);
+  this->declare_parameter<double>("kExecutionReferenceShortcutMaxDistance",
+                                  1.2);
 
   // Int
   this->declare_parameter<int>("kDirectionChangeCounterThr", 4);
@@ -206,6 +214,10 @@ void SensorCoveragePlanner3D::ReadParameters() {
                       pub_runtime_breakdown_topic_);
   this->get_parameter("pub_runtime_topic_", pub_runtime_topic_);
   this->get_parameter("pub_waypoint_topic_", pub_waypoint_topic_);
+  this->get_parameter("pub_execution_reference_path_topic_",
+                      pub_execution_reference_path_topic_);
+  this->get_parameter("pub_execution_reference_status_topic_",
+                      pub_execution_reference_status_topic_);
   this->get_parameter("pub_momentum_activation_count_topic_",
                       pub_momentum_activation_count_topic_);
 
@@ -231,6 +243,8 @@ void SensorCoveragePlanner3D::ReadParameters() {
   this->get_parameter("kExtendWayPointDistanceBig", kExtendWayPointDistanceBig);
   this->get_parameter("kExtendWayPointDistanceSmall",
                       kExtendWayPointDistanceSmall);
+  this->get_parameter("kExecutionReferenceShortcutMaxDistance",
+                      kExecutionReferenceShortcutMaxDistance);
 
   this->get_parameter("kDirectionChangeCounterThr", kDirectionChangeCounterThr);
   this->get_parameter("kDirectionNoChangeCounterThr",
@@ -296,7 +310,8 @@ void SensorCoveragePlanner3D::InitializeData() {
           shared_from_this(), "pointcloud_manager_cloud", world_frame_id_);
   reordered_global_subspace_cloud_ =
       std::make_shared<pointcloud_utils_ns::PCLCloud<pcl::PointXYZI>>(
-          shared_from_this(), "reordered_global_subspace_cloud", world_frame_id_);
+          shared_from_this(), "reordered_global_subspace_cloud",
+          world_frame_id_);
 
   viewpoint_manager_ = std::make_shared<viewpoint_manager_ns::ViewPointManager>(
       shared_from_this());
@@ -452,8 +467,14 @@ bool SensorCoveragePlanner3D::initialize() {
       this->create_publisher<nav_msgs::msg::Path>("local_path", 1);
   exploration_path_publisher_ =
       this->create_publisher<nav_msgs::msg::Path>("exploration_path", 1);
+  execution_reference_path_publisher_ =
+      this->create_publisher<nav_msgs::msg::Path>(
+          pub_execution_reference_path_topic_, 1);
   waypoint_pub_ = this->create_publisher<geometry_msgs::msg::PointStamped>(
       pub_waypoint_topic_, 2);
+  execution_reference_status_publisher_ =
+      this->create_publisher<std_msgs::msg::String>(
+          pub_execution_reference_status_topic_, 2);
   exploration_finish_pub_ = this->create_publisher<std_msgs::msg::Bool>(
       pub_exploration_finish_topic_, 2);
   runtime_breakdown_pub_ =
@@ -516,11 +537,10 @@ void SensorCoveragePlanner3D::RegisteredScanCallback(
       new pcl::PointCloud<pcl::PointXYZ>());
   pcl::fromROSMsg(*registered_scan_msg, *registered_scan_tmp);
   registered_scan_tmp->points.erase(
-      std::remove_if(registered_scan_tmp->points.begin(),
-                     registered_scan_tmp->points.end(),
-                     [](const pcl::PointXYZ &point) {
-                       return !pcl::isFinite(point);
-                     }),
+      std::remove_if(
+          registered_scan_tmp->points.begin(),
+          registered_scan_tmp->points.end(),
+          [](const pcl::PointXYZ &point) { return !pcl::isFinite(point); }),
       registered_scan_tmp->points.end());
   registered_scan_tmp->width = registered_scan_tmp->points.size();
   registered_scan_tmp->height = 1;
@@ -1043,6 +1063,11 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
     Eigen::Vector3d &lookahead_point) {
   Eigen::Vector3d robot_position(robot_position_.x, robot_position_.y,
                                  robot_position_.z);
+  execution_reference_selection_valid_ = false;
+  execution_reference_robot_index_ = -1;
+  execution_reference_target_index_ = -1;
+  execution_reference_direction_step_ = 0;
+  execution_reference_uses_global_path_ = false;
 
   // Determine which direction to follow on the global path
   double dist_from_start = 0.0;
@@ -1077,34 +1102,26 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
     }
   }
   if (local_path.GetNodeNum() < 1 || local_path_too_short) {
-    if (dist_from_start < dist_from_end) {
-      double dist_from_robot = 0.0;
-      for (int i = 1; i < global_path.nodes_.size(); i++) {
-        dist_from_robot += (global_path.nodes_[i - 1].position_ -
-                            global_path.nodes_[i].position_)
-                               .norm();
-        if (dist_from_robot > kLookAheadDistance / 2) {
-          lookahead_point = global_path.nodes_[i].position_;
-          break;
-        }
-      }
-    } else {
-      double dist_from_robot = 0.0;
-      for (int i = global_path.nodes_.size() - 2; i > 0; i--) {
-        dist_from_robot += (global_path.nodes_[i + 1].position_ -
-                            global_path.nodes_[i].position_)
-                               .norm();
-        if (dist_from_robot > kLookAheadDistance / 2) {
-          lookahead_point = global_path.nodes_[i].position_;
-          break;
-        }
-      }
+    std::vector<Eigen::Vector3d> global_positions;
+    global_positions.reserve(global_path.nodes_.size());
+    for (const auto &node : global_path.nodes_) {
+      global_positions.push_back(node.position_);
+    }
+    const auto selection =
+        SelectGlobalExecutionReference(global_positions, kLookAheadDistance / 2,
+                                       dist_from_start < dist_from_end);
+    if (selection.valid) {
+      lookahead_point = global_positions[selection.target_index];
+      execution_reference_robot_index_ = selection.robot_index;
+      execution_reference_target_index_ = selection.target_index;
+      execution_reference_direction_step_ = selection.direction_step;
+      execution_reference_selection_valid_ = true;
+      execution_reference_uses_global_path_ = true;
     }
     return false;
   }
 
   bool has_lookahead = false;
-  bool dir = true;
   int robot_i = 0;
   int lookahead_i = 0;
   for (int i = 0; i < local_path.nodes_.size(); i++) {
@@ -1159,6 +1176,8 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
   if (local_loop) {
     robot_i = 0;
   }
+  const int forward_robot_i = robot_i;
+  int forward_target_i = -1;
   bool forward_lookahead_point_in_los = true;
   bool backward_lookahead_point_in_los = true;
   double length_from_robot = 0.0;
@@ -1188,6 +1207,7 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
         forward_lookahead_point_in_los = false;
       }
       forward_lookahead_point = local_path.nodes_[i].position_;
+      forward_target_i = i;
       has_forward = true;
       break;
     }
@@ -1195,6 +1215,8 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
   if (local_loop) {
     robot_i = local_path.nodes_.size() - 1;
   }
+  const int backward_robot_i = robot_i;
+  int backward_target_i = -1;
   length_from_robot = 0.0;
   for (int i = robot_i - 1; i >= 0; i--) {
     length_from_robot +=
@@ -1222,6 +1244,7 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
         backward_lookahead_point_in_los = false;
       }
       backward_lookahead_point = local_path.nodes_[i].position_;
+      backward_target_i = i;
       has_backward = true;
       break;
     }
@@ -1281,6 +1304,26 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
 
   lookahead_point_cloud_->cloud_->clear();
 
+  auto select_reference = [&](const Eigen::Vector3d &point, int robot_index,
+                              int target_index, int direction_step) {
+    lookahead_point = point;
+    execution_reference_robot_index_ = robot_index;
+    execution_reference_target_index_ = target_index;
+    execution_reference_direction_step_ = direction_step;
+    execution_reference_selection_valid_ =
+        robot_index >= 0 && target_index >= 0 && robot_index != target_index &&
+        (direction_step == 1 || direction_step == -1);
+  };
+
+  auto select_forward = [&]() {
+    select_reference(forward_lookahead_point, forward_robot_i, forward_target_i,
+                     1);
+  };
+  auto select_backward = [&]() {
+    select_reference(backward_lookahead_point, backward_robot_i,
+                     backward_target_i, -1);
+  };
+
   if (forward_viewpoint_count == 0 && backward_viewpoint_count == 0) {
     relocation_ = true;
   } else {
@@ -1289,24 +1332,26 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
   if (relocation_) {
     if (use_momentum_ && kUseMomentum) {
       if (forward_angle_score > backward_angle_score) {
-        lookahead_point = forward_lookahead_point;
+        select_forward();
       } else {
-        lookahead_point = backward_lookahead_point;
+        select_backward();
       }
     } else {
       // follow the shorter distance one
       if (dist_from_start < dist_from_end &&
           local_path.nodes_.front().type_ !=
               exploration_path_ns::NodeType::ROBOT) {
-        lookahead_point = backward_lookahead_point;
+        select_backward();
       } else if (dist_from_end < dist_from_start &&
                  local_path.nodes_.back().type_ !=
                      exploration_path_ns::NodeType::ROBOT) {
-        lookahead_point = forward_lookahead_point;
+        select_forward();
       } else {
-        lookahead_point = forward_angle_score > backward_angle_score
-                              ? forward_lookahead_point
-                              : backward_lookahead_point;
+        if (forward_angle_score > backward_angle_score) {
+          select_forward();
+        } else {
+          select_backward();
+        }
       }
     }
   } else if (has_lookahead && lookahead_angle_score > 0 &&
@@ -1315,19 +1360,29 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
                  local_path.nodes_[lookahead_i].position_))
 
   {
-    lookahead_point = local_path.nodes_[lookahead_i].position_;
+    int direction_step = 0;
+    int selected_robot_i = robot_i;
+    if (!local_loop) {
+      direction_step = lookahead_i > robot_i ? 1 : -1;
+    } else {
+      direction_step = forward_angle_score >= backward_angle_score ? 1 : -1;
+      selected_robot_i =
+          direction_step > 0 ? forward_robot_i : backward_robot_i;
+    }
+    select_reference(local_path.nodes_[lookahead_i].position_, selected_robot_i,
+                     lookahead_i, direction_step);
   } else {
     if (forward_angle_score > backward_angle_score) {
       if (forward_viewpoint_count > 0) {
-        lookahead_point = forward_lookahead_point;
+        select_forward();
       } else {
-        lookahead_point = backward_lookahead_point;
+        select_backward();
       }
     } else {
       if (backward_viewpoint_count > 0) {
-        lookahead_point = backward_lookahead_point;
+        select_backward();
       } else {
-        lookahead_point = forward_lookahead_point;
+        select_forward();
       }
     }
   }
@@ -1360,6 +1415,133 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
     lookahead_point_cloud_->cloud_->points.push_back(point);
   }
   return true;
+}
+
+void SensorCoveragePlanner3D::PublishExecutionReferencePath(
+    const exploration_path_ns::ExplorationPath &local_path,
+    const exploration_path_ns::ExplorationPath &global_path) {
+  const exploration_path_ns::ExplorationPath *source_path =
+      execution_reference_uses_global_path_ ? &global_path : &local_path;
+  std::string source_name =
+      execution_reference_uses_global_path_ ? "global" : "local";
+
+  std_msgs::msg::String status;
+  int raw_node_count = 0;
+  int simplified_node_count = 0;
+  std::size_t shortcut_count = 0;
+  double raw_turn_sum = 0.0;
+  double simplified_turn_sum = 0.0;
+  auto publish_status = [&](const std::string &reason, int robot_index,
+                            int target_index, const std::string &direction,
+                            double path_length, int node_count) {
+    std::ostringstream stream;
+    stream << "{\"source\":\"" << source_name << "\",\"reason\":\"" << reason
+           << "\",\"direction\":\"" << direction
+           << "\",\"robot_index\":" << robot_index
+           << ",\"lookahead_index\":" << target_index
+           << ",\"lookahead_in_los\":"
+           << (lookahead_point_in_line_of_sight_ ? "true" : "false")
+           << ",\"relocation\":" << (relocation_ ? "true" : "false")
+           << ",\"path_length_m\":" << path_length
+           << ",\"node_count\":" << node_count
+           << ",\"raw_node_count\":" << raw_node_count
+           << ",\"simplified_node_count\":" << simplified_node_count
+           << ",\"shortcut_count\":" << shortcut_count
+           << ",\"raw_turn_sum_rad\":" << raw_turn_sum
+           << ",\"simplified_turn_sum_rad\":" << simplified_turn_sum << "}";
+    status.data = stream.str();
+    execution_reference_status_publisher_->publish(status);
+  };
+
+  if (source_path->nodes_.size() < 2) {
+    publish_status("path_too_short", -1, -1, "none", 0.0, 0);
+    return;
+  }
+
+  const Eigen::Vector3d robot_position(robot_position_.x, robot_position_.y,
+                                       robot_position_.z);
+  const auto &nodes = source_path->nodes_;
+  const int robot_index = execution_reference_robot_index_;
+  const int lookahead_index = execution_reference_target_index_;
+  const int direction_step = execution_reference_direction_step_;
+  if (!execution_reference_selection_valid_) {
+    publish_status("selection_unavailable", robot_index, lookahead_index,
+                   "none", 0.0, 0);
+    return;
+  }
+
+  const bool loop =
+      nodes.size() >= 4 &&
+      (nodes.front().position_ - nodes.back().position_).norm() < 0.25;
+  std::vector<Eigen::Vector3d> node_positions;
+  node_positions.reserve(nodes.size());
+  for (const auto &node : nodes) {
+    node_positions.push_back(node.position_);
+  }
+  const std::vector<Eigen::Vector3d> selected_arc =
+      BuildOrderedExecutionReferenceArc(node_positions, robot_position,
+                                        robot_index, lookahead_index,
+                                        direction_step, loop);
+
+  auto path_length = [](const std::vector<Eigen::Vector3d> &arc) {
+    double length = 0.0;
+    for (int i = 1; i < static_cast<int>(arc.size()); ++i) {
+      length += (arc[i] - arc[i - 1]).norm();
+    }
+    return length;
+  };
+
+  const std::string direction = direction_step > 0 ? "forward" : "backward";
+  if (selected_arc.size() < 2) {
+    publish_status("lookahead_unreachable_on_path", robot_index,
+                   lookahead_index, direction, 0.0, selected_arc.size());
+    return;
+  }
+
+  raw_node_count = static_cast<int>(selected_arc.size());
+  raw_turn_sum = PathTurnSum(selected_arc);
+  const bool shortcut_map_ready = planning_env_ && viewpoint_manager_ &&
+                                  viewpoint_manager_->GetViewPointNum() > 0;
+  const auto point_valid = [&](const Eigen::Vector3d &point) {
+    const int viewpoint_index = viewpoint_manager_->GetViewPointInd(point);
+    if (!viewpoint_manager_->InRange(viewpoint_index)) {
+      return false;
+    }
+    if (!viewpoint_manager_->ViewPointHasTerrainHeight(viewpoint_index) ||
+        !viewpoint_manager_->ViewPointConnected(viewpoint_index) ||
+        viewpoint_manager_->ViewPointInCollision(viewpoint_index)) {
+      return false;
+    }
+    return !planning_env_->InCollision(point.x(), point.y(), point.z());
+  };
+  const auto shortcut_result = SimplifyExecutionReference(
+      selected_arc, kExecutionReferenceShortcutMaxDistance, 0.1,
+      shortcut_map_ready, point_valid);
+  const std::vector<Eigen::Vector3d> &reference_points =
+      shortcut_result.points.size() >= 2 ? shortcut_result.points
+                                         : selected_arc;
+  shortcut_count = reference_points.size() == shortcut_result.points.size()
+                       ? shortcut_result.shortcut_count
+                       : 0;
+  simplified_node_count = static_cast<int>(reference_points.size());
+  simplified_turn_sum = PathTurnSum(reference_points);
+
+  nav_msgs::msg::Path reference_path;
+  reference_path.header.frame_id = world_frame_id_;
+  reference_path.header.stamp = this->now();
+  for (const auto &point : reference_points) {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = reference_path.header;
+    pose.pose.position.x = point.x();
+    pose.pose.position.y = point.y();
+    pose.pose.position.z = point.z();
+    pose.pose.orientation.w = 1.0;
+    reference_path.poses.push_back(pose);
+  }
+
+  execution_reference_path_publisher_->publish(reference_path);
+  publish_status("path_published", robot_index, lookahead_index, direction,
+                 path_length(reference_points), reference_points.size());
 }
 
 void SensorCoveragePlanner3D::PublishWaypoint() {
@@ -1485,13 +1667,15 @@ void SensorCoveragePlanner3D::execute() {
   overall_runtime_ = 0;
 
   if (!initialized_) {
-    SendInitialWaypoint();
     start_time_ = this->now().seconds();
-    if(start_time_ == 0.0){
-      RCLCPP_ERROR(this->get_logger(), "Start time is zero, time source (use_time_time) not set correctly. Exiting...");
-      exit(1);
+    if (start_time_ <= 0.0) {
+      RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 5000,
+          "Waiting for a non-zero ROS time before initializing exploration");
+      return;
     }
-    global_direction_switch_time_ = this->now().seconds();
+    SendInitialWaypoint();
+    global_direction_switch_time_ = start_time_;
     initialized_ = true;
     return;
   }
@@ -1566,6 +1750,7 @@ void SensorCoveragePlanner3D::execute() {
 
     lookahead_point_update_ =
         GetLookAheadPoint(exploration_path_, global_path, lookahead_point_);
+    PublishExecutionReferencePath(exploration_path_, global_path);
     PublishWaypoint();
 
     overall_processing_timer.Stop(false);
