@@ -414,20 +414,20 @@ bool SensorCoveragePlanner3D::initialize() {
                 std::placeholders::_1));
   registered_scan_sub_ =
       this->create_subscription<sensor_msgs::msg::PointCloud2>(
-          sub_registered_scan_topic_, 5,
+          sub_registered_scan_topic_, rclcpp::SensorDataQoS(),
           std::bind(&SensorCoveragePlanner3D::RegisteredScanCallback, this,
                     std::placeholders::_1));
   terrain_map_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      sub_terrain_map_topic_, 5,
+      sub_terrain_map_topic_, rclcpp::SensorDataQoS(),
       std::bind(&SensorCoveragePlanner3D::TerrainMapCallback, this,
                 std::placeholders::_1));
   terrain_map_ext_sub_ =
       this->create_subscription<sensor_msgs::msg::PointCloud2>(
-          sub_terrain_map_ext_topic_, 5,
+          sub_terrain_map_ext_topic_, rclcpp::SensorDataQoS(),
           std::bind(&SensorCoveragePlanner3D::TerrainMapExtCallback, this,
                     std::placeholders::_1));
   state_estimation_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-      sub_state_estimation_topic_, 5,
+      sub_state_estimation_topic_, rclcpp::SensorDataQoS(),
       std::bind(&SensorCoveragePlanner3D::StateEstimationCallback, this,
                 std::placeholders::_1));
   coverage_boundary_sub_ =
