@@ -30,6 +30,8 @@
 #include <grid/grid.h>
 #include <rolling_grid/rolling_grid.h>
 #include <viewpoint/viewpoint.h>
+#include <viewpoint_manager/forward_view.h>
+#include <geometry_msgs/msg/pose_array.hpp>
 #include <utils/misc_utils.h>
 #include <grid_world/grid_world.h>
 #include <exploration_path/exploration_path.h>
@@ -79,6 +81,10 @@ struct ViewPointManagerParameter
   double kNeighborRange;
   double kHeightFromTerrain;
   double kDistanceToIntConst;
+
+  bool kUseForwardSensor = false;
+  double kForwardHorizontalFOV = 120.;
+  double kForwardVerticalFOV = 90.;
 
   // FOV
   double kVerticalFOVRatio;
@@ -148,6 +154,18 @@ public:
   bool InFOVAndRange(const Eigen::Vector3d& point_position, const Eigen::Vector3d& viewpoint_position);
   bool InRobotFOV(const Eigen::Vector3d& position);
   void CheckViewPointConnectivity();
+  void SetRobotYaw(double yaw) { robot_yaw_ = yaw; }
+  geometry_msgs::msg::PoseArray GetCandidateObservationPoses() const;
+  bool UsesForwardSensor() const { return vp_.kUseForwardSensor; }
+  // This is prediction geometry, not a test for observed free space.
+  bool InCoverageRange(const geometry_msgs::msg::Point& position, double x, double y, double z) const
+  {
+    if (vp_.kUseForwardSensor)
+      return forward_view_->InVerticalRange(x-position.x, y-position.y, z-position.z);
+    return misc_utils_ns::InFOVSimple(Eigen::Vector3d(x,y,z),
+        Eigen::Vector3d(position.x, position.y, position.z), vp_.kVerticalFOVRatio,
+        vp_.kSensorRange, vp_.kInFovXYDistThreshold, vp_.kInFovZDiffThreshold);
+  }
   void UpdateViewPointVisited(const std::vector<Eigen::Vector3d>& positions);
   void UpdateViewPointVisited(std::shared_ptr<grid_world_ns::GridWorld> const& grid_world);
   void SetViewPointHeightWithTerrain(const pcl::PointCloud<pcl::PointXYZI>::Ptr& terrain_cloud,
@@ -177,10 +195,7 @@ public:
           continue;
         }
         geometry_msgs::msg::Point viewpoint_position = viewpoints_[i].GetPosition();
-        if (misc_utils_ns::InFOVSimple(
-                Eigen::Vector3d(point.x, point.y, point.z),
-                Eigen::Vector3d(viewpoint_position.x, viewpoint_position.y, viewpoint_position.z),
-                vp_.kVerticalFOVRatio, vp_.kSensorRange, vp_.kInFovXYDistThreshold, vp_.kInFovZDiffThreshold))
+        if (InCoverageRange(viewpoint_position, point.x, point.y, point.z))
         {
           viewpoints_[i].UpdateCoverage<PCLPointType>(point);
         }
@@ -201,10 +216,7 @@ public:
           continue;
         }
         geometry_msgs::msg::Point viewpoint_position = viewpoints_[array_ind].GetPosition();
-        if (misc_utils_ns::InFOVSimple(
-                Eigen::Vector3d(point.x, point.y, point.z),
-                Eigen::Vector3d(viewpoint_position.x, viewpoint_position.y, viewpoint_position.z),
-                vp_.kVerticalFOVRatio, vp_.kSensorRange, vp_.kInFovXYDistThreshold, vp_.kInFovZDiffThreshold))
+        if (InCoverageRange(viewpoint_position, point.x, point.y, point.z))
         {
           viewpoints_[array_ind].UpdateCoverage<PCLPointType>(point);
         }
@@ -231,6 +243,13 @@ public:
     MY_ASSERT(grid_->InRange(viewpoint_ind));
     int array_ind = grid_->GetArrayInd(viewpoint_ind);
     geometry_msgs::msg::Point viewpoint_position = viewpoints_[array_ind].GetPosition();
+    if (vp_.kUseForwardSensor)
+    {
+      const auto& heading = arrival_directions_[array_ind];
+      return forward_view_->Contains(point.x-viewpoint_position.x, point.y-viewpoint_position.y,
+                                     point.z-viewpoint_position.z, heading.x(), heading.y()) &&
+             viewpoints_[array_ind].CheckVisibility<PointType>(point, vp_.kCoverageOcclusionThr);
+    }
     if (std::abs(point.z - viewpoint_position.z) > vp_.kDiffZMax)
     {
       return false;
@@ -338,6 +357,7 @@ public:
   typedef std::shared_ptr<ViewPointManager> Ptr;
 
 private:
+  friend struct ForwardExplorationRegressionPeer;
   void ComputeConnectedNeighborIndices();
   void ComputeInRangeNeighborIndices();
   void GetCandidateViewPointGraph(std::vector<std::vector<int>>& graph, std::vector<std::vector<double>>& dist,
@@ -346,6 +366,9 @@ private:
 
   bool initialized_;
   ViewPointManagerParameter vp_;
+  std::unique_ptr<ForwardView> forward_view_;
+  std::vector<Eigen::Vector2d> arrival_directions_;
+  double robot_yaw_ = 0.;
   std::shared_ptr<rolling_grid_ns::RollingGrid> grid_;
   std::vector<viewpoint_ns::ViewPoint> viewpoints_;
   std::vector<std::vector<int>> connected_neighbor_indices_;

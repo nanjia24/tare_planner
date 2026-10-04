@@ -16,6 +16,9 @@ namespace viewpoint_manager_ns
 bool ViewPointManagerParameter::ReadParameters(rclcpp::Node::SharedPtr nh)
 {
   nh->get_parameter("kUseFrontier", kUseFrontier);
+  nh->get_parameter_or("kUseForwardSensor", kUseForwardSensor, false);
+  nh->get_parameter_or("kForwardSensorHorizontalFOV", kForwardHorizontalFOV, 120.);
+  nh->get_parameter_or("kForwardSensorVerticalFOV", kForwardVerticalFOV, 90.);
   kNumber.x() = nh->get_parameter("viewpoint_manager/number_x").as_int();
   kNumber.y() = nh->get_parameter("viewpoint_manager/number_y").as_int();
   kNumber.z() = nh->get_parameter("viewpoint_manager/number_z").as_int();
@@ -80,6 +83,10 @@ ViewPointManager::ViewPointManager(rclcpp::Node::SharedPtr nh) : initialized_(fa
   origin_ = Eigen::Vector3d::Zero();
 
   viewpoints_.resize(vp_.kViewPointNumber);
+  arrival_directions_.assign(vp_.kViewPointNumber, Eigen::Vector2d::UnitX());
+  if (vp_.kUseForwardSensor)
+    forward_view_ = std::make_unique<ForwardView>(vp_.kForwardHorizontalFOV,
+                                               vp_.kForwardVerticalFOV, vp_.kSensorRange);
   for (int x = 0; x < vp_.kNumber.x(); x++)
   {
     for (int y = 0; y < vp_.kNumber.y(); y++)
@@ -89,6 +96,8 @@ ViewPointManager::ViewPointManager(rclcpp::Node::SharedPtr nh) : initialized_(fa
         Eigen::Vector3i sub(x, y, z);
         int ind = grid_->Sub2Ind(sub);
         viewpoints_[ind] = viewpoint_ns::ViewPoint();
+        if (vp_.kUseForwardSensor)
+          viewpoints_[ind].ConfigurePrediction(vp_.kForwardVerticalFOV);
       }
     }
   }
@@ -812,6 +821,8 @@ void ViewPointManager::CheckViewPointConnectivity()
   std::vector<bool> checked(vp_.kViewPointNumber, false);
   checked[robot_ind] = true;
   SetViewPointConnected(robot_ind, true);
+  if (vp_.kUseForwardSensor)
+    arrival_directions_[robot_array_ind] = Eigen::Vector2d(std::cos(robot_yaw_), std::sin(robot_yaw_));
   std::list<int> queue;
   queue.push_back(robot_ind);
   int connected_viewpoint_count = 1;
@@ -832,6 +843,16 @@ void ViewPointManager::CheckViewPointConnectivity()
         if (std::abs(GetViewPointHeight(cur_ind) - GetViewPointHeight(neighbor_ind)) < vp_.kConnectivityHeightDiffThr)
         {
           SetViewPointConnected(neighbor_ind, true);
+          if (vp_.kUseForwardSensor)
+          {
+            // Reuse the existing connectivity tree. Its last edge estimates
+            // arrival heading without a separate shortest-path search per cell.
+            const auto from = GetViewPointPosition(cur_ind);
+            const auto to = GetViewPointPosition(neighbor_ind);
+            Eigen::Vector2d direction(to.x-from.x, to.y-from.y);
+            arrival_directions_[grid_->GetArrayInd(neighbor_ind)] = direction.norm() > 1e-6 ?
+                Eigen::Vector2d(direction.normalized()) : arrival_directions_[grid_->GetArrayInd(cur_ind)];
+          }
           connected_viewpoint_count++;
           queue.push_back(neighbor_ind);
         }
@@ -841,8 +862,31 @@ void ViewPointManager::CheckViewPointConnectivity()
   }
 }
 
+geometry_msgs::msg::PoseArray ViewPointManager::GetCandidateObservationPoses() const
+{
+  geometry_msgs::msg::PoseArray poses;
+  if (!vp_.kUseForwardSensor) return poses;
+  poses.poses.reserve(candidate_indices_.size());
+  for (int index : candidate_indices_)
+  {
+    const int array_index = grid_->GetArrayInd(index);
+    geometry_msgs::msg::Pose pose;
+    pose.position = viewpoints_[array_index].GetPosition();
+    const auto& direction = arrival_directions_[array_index];
+    const double yaw = std::atan2(direction.y(), direction.x());
+    pose.orientation.z = std::sin(yaw/2.);
+    pose.orientation.w = std::cos(yaw/2.);
+    poses.poses.push_back(pose);
+  }
+  return poses;
+}
+
 void ViewPointManager::UpdateViewPointVisited(const std::vector<Eigen::Vector3d>& positions)
 {
+  // Position proximity is not evidence that a forward sensor observed all
+  // headings. Actual covered surface flags and frontier ray tracing remove
+  // gain; allow revisiting a position when unseen gain remains.
+  if (vp_.kUseForwardSensor) return;
   if (!initialized_)
     return;
 

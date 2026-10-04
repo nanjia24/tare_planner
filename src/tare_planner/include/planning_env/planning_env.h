@@ -141,8 +141,9 @@ public:
       {
         rolling_occupancy_grid_->UpdateOccupancy<PCLPointType>(cloud);
         rolling_occupancy_grid_->RayTrace(robot_position_);
-        rolling_occupancy_grid_->GetVisualizationCloud(rolling_occupancy_grid_cloud_->cloud_);
-        // rolling_occupancy_grid_cloud_->Publish();
+        // Do not scan all 9M occupancy cells to construct an unpublished debug
+        // cloud on every sensor callback. Ray tracing above maintains the map;
+        // planning/frontier queries read the occupancy grid directly.
       }
     }
   }
@@ -273,13 +274,21 @@ public:
 
   pcl::PointCloud<pcl::PointXYZI>::Ptr GetCollisionCloud()
   {
-    return collision_cloud_;
+    return use_external_collision_cloud_ ? external_collision_cloud_ : collision_cloud_;
   }
   pcl::PointCloud<PlannerCloudPointType>::Ptr GetStackedCloud()
   {
     return stacked_cloud_->cloud_;
   }
 
+  // A segmented obstacle cloud is separate from the complete observation map.
+  void UseExternalCollisionCloud(bool enabled) { use_external_collision_cloud_ = enabled; }
+  void SetExternalCollisionCloud(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud)
+  {
+    external_collision_cloud_.reset(new pcl::PointCloud<pcl::PointXYZI>(*cloud));
+    if (!external_collision_cloud_->empty())
+      external_collision_kdtree_.setInputCloud(external_collision_cloud_);
+  }
   void UpdateTerrainCloud(const pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud);
   void UpdateCollisionCostGrid();
   bool InCollision(double x, double y, double z) const;
@@ -308,6 +317,10 @@ public:
   void PublishUncoveredFrontierCloud();
 
 private:
+  bool use_external_collision_cloud_ = false;
+  pcl::PointCloud<pcl::PointXYZI>::Ptr external_collision_cloud_;
+  pcl::KdTreeFLANN<pcl::PointXYZI> external_collision_kdtree_;
+
   PlanningEnvParameters parameters_;
 
   std::vector<typename PlannerCloudType::Ptr> keypose_cloud_stack_;

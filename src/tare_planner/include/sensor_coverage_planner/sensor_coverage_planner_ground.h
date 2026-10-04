@@ -10,6 +10,9 @@
  */
 #pragma once
 
+#include "sensor_coverage_planner/segmented_cloud_buffer.h"
+#include "sensor_coverage_planner/latest_planner_input.h"
+#include <chrono>
 #include <cmath>
 #include <vector>
 
@@ -72,6 +75,27 @@ public:
   ~SensorCoveragePlanner3D() = default;
 
 private:
+  friend struct GlobalFallbackRegressionPeer;
+  void UpdateCompletionState(bool ready_to_return, bool robot_in_collision, bool reference_valid);
+  friend struct ForwardExplorationRegressionPeer;
+  bool latest_input_scheduling_{false};
+  double planning_period_s_{1.0};
+  int keypose_cloud_frames_{5};
+  LatestPlannerInput<sensor_msgs::msg::PointCloud2> latest_scan_;
+  LatestPlannerInput<nav_msgs::msg::Odometry> latest_odometry_;
+  rclcpp::CallbackGroup::SharedPtr planner_input_group_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr planning_status_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr observation_poses_pub_;
+  uint64_t planning_cycle_{0}, reference_source_switches_{0};
+  std::string previous_reference_source_{"none"};
+  std::string reference_selection_reason_{"not_selected"};
+  int diagnostic_candidates_{-1}, diagnostic_uncovered_{-1}, diagnostic_frontiers_{-1};
+  int diagnostic_local_nodes_{0}, diagnostic_global_nodes_{0};
+  double diagnostic_local_length_{0}, diagnostic_global_length_{0};
+  double diagnostic_scan_ms_{0}, diagnostic_scan_stamp_{0}, diagnostic_odom_stamp_{0};
+  double diagnostic_reference_interval_{0}, diagnostic_reference_stamp_{0};
+  std::chrono::steady_clock::time_point planning_cycle_start_;
+  void PublishPlanningStatus(const std::string& reason);
   // Parameters
   // String
   std::string world_frame_id_ = "map";
@@ -96,6 +120,16 @@ private:
   std::string pub_momentum_activation_count_topic_;
 
   // Bool
+  bool use_segmented_terrain_ = false;
+  double segmented_max_age_ = 0.5;
+  double segmented_terrain_stamp_ = 0.0;
+  double segmented_ground_stamp_ = 0.0;
+  SegmentedCloudBuffer segmented_cloud_buffer_;
+  rclcpp::CallbackGroup::SharedPtr segmented_input_group_;
+  void CacheSegmentedCloud(sensor_msgs::msg::PointCloud2::ConstSharedPtr message, bool ground);
+  void ConsumeSegmentedClouds();
+  bool SegmentedTerrainReady() const;
+  bool AcceptSegmentedCloud(const sensor_msgs::msg::PointCloud2& message, double previous_stamp) const;
   bool kAutoStart;
   bool kRushHome;
   bool kUseTerrainHeight;
@@ -159,11 +193,13 @@ private:
   geometry_msgs::msg::Point robot_position_;
   geometry_msgs::msg::Point last_robot_position_;
   lidar_model_ns::LiDARModel robot_viewpoint_;
+  geometry_msgs::msg::Pose coverage_observation_pose_;
   exploration_path_ns::ExplorationPath exploration_path_;
   Eigen::Vector3d lookahead_point_;
   Eigen::Vector3d lookahead_point_direction_;
   Eigen::Vector3d moving_direction_;
   double robot_yaw_;
+  geometry_msgs::msg::Quaternion robot_orientation_;
   bool moving_forward_;
   std::vector<Eigen::Vector3d> visited_positions_;
   int cur_keypose_node_ind_;

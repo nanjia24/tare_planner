@@ -13,9 +13,11 @@
 #include "graph/graph.h"
 #include "sensor_coverage_planner/execution_reference_shortcut.h"
 #include <algorithm>
+#include <chrono>
 #include <memory>
 #include <pcl/common/point_tests.h>
 #include <sstream>
+#include <iomanip>
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
 
@@ -28,6 +30,12 @@ namespace sensor_coverage_planner_3d_ns {
 
 // bool PlannerParameters::ReadParameters(rclcpp::Node::SharedPtr node_)
 void SensorCoveragePlanner3D::ReadParameters() {
+  latest_input_scheduling_ = declare_parameter<bool>("kLatestInputScheduling", false);
+  planning_period_s_ = declare_parameter<double>("kPlanningPeriod", 1.0);
+  keypose_cloud_frames_ = declare_parameter<int>("kKeyposeCloudFrames", 5);
+  if (!std::isfinite(planning_period_s_) || planning_period_s_ < .1 || planning_period_s_ > 5. ||
+      keypose_cloud_frames_ < 1 || keypose_cloud_frames_ > 20)
+    throw std::invalid_argument("Invalid planning period or keypose cloud frame count");
   this->declare_parameter<std::string>("world_frame", "map");
   this->declare_parameter<std::string>("sub_start_exploration_topic_",
                                        "/exploration_start");
@@ -60,6 +68,15 @@ void SensorCoveragePlanner3D::ReadParameters() {
                                        "/tare/execution_reference_status");
   this->declare_parameter<std::string>("pub_momentum_activation_count_topic_",
                                        "momentum_activation_count");
+
+  this->declare_parameter<bool>("kUseForwardSensor", false);
+  this->declare_parameter<double>("kForwardSensorHorizontalFOV", 120.0);
+  this->declare_parameter<double>("kForwardSensorVerticalFOV", 90.0);
+
+  use_segmented_terrain_ = this->declare_parameter<bool>("kUseSegmentedTerrain", false);
+  segmented_max_age_ = this->declare_parameter<double>("kSegmentedTerrainMaxAge", 0.5);
+  if (!std::isfinite(segmented_max_age_) || segmented_max_age_ < 0)
+    throw std::invalid_argument("kSegmentedTerrainMaxAge must be nonnegative (zero disables expiry)");
 
   // Bool
   this->declare_parameter<bool>("kAutoStart", false);
@@ -315,10 +332,17 @@ void SensorCoveragePlanner3D::InitializeData() {
 
   viewpoint_manager_ = std::make_shared<viewpoint_manager_ns::ViewPointManager>(
       shared_from_this());
+  if (this->get_parameter("kUseForwardSensor").as_bool()) {
+    robot_viewpoint_.ConfigureForwardSensor(
+        this->get_parameter("kForwardSensorHorizontalFOV").as_double(),
+        this->get_parameter("kForwardSensorVerticalFOV").as_double(),
+        viewpoint_manager_->GetSensorRange());
+  }
   keypose_graph_ =
       std::make_shared<keypose_graph_ns::KeyposeGraph>(shared_from_this());
   planning_env_ = std::make_shared<planning_env_ns::PlanningEnv>(
       shared_from_this(), world_frame_id_);
+  planning_env_->UseExternalCollisionCloud(use_segmented_terrain_);
   grid_world_ = std::make_shared<grid_world_ns::GridWorld>(shared_from_this());
   grid_world_->SetUseKeyposeGraph(true);
   local_coverage_planner_ =
@@ -406,7 +430,15 @@ bool SensorCoveragePlanner3D::initialize() {
       planning_env_->GetPlannerCloudResolution());
 
   execution_timer_ = this->create_wall_timer(
-      1000ms, std::bind(&SensorCoveragePlanner3D::execute, this));
+      std::chrono::duration<double>(planning_period_s_),
+      std::bind(&SensorCoveragePlanner3D::execute, this));
+  planning_status_pub_ = create_publisher<std_msgs::msg::String>("/tare/planning_status", 10);
+  observation_poses_pub_ = create_publisher<geometry_msgs::msg::PoseArray>("/tare/candidate_observation_poses", 1);
+  rclcpp::SubscriptionOptions input_options;
+  if (latest_input_scheduling_) {
+    planner_input_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    input_options.callback_group = planner_input_group_;
+  }
 
   exploration_start_sub_ = this->create_subscription<std_msgs::msg::Bool>(
       sub_start_exploration_topic_, 5,
@@ -414,22 +446,40 @@ bool SensorCoveragePlanner3D::initialize() {
                 std::placeholders::_1));
   registered_scan_sub_ =
       this->create_subscription<sensor_msgs::msg::PointCloud2>(
-          sub_registered_scan_topic_, rclcpp::SensorDataQoS(),
-          std::bind(&SensorCoveragePlanner3D::RegisteredScanCallback, this,
-                    std::placeholders::_1));
+          sub_registered_scan_topic_, rclcpp::SensorDataQoS().keep_last(1),
+          [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr message) {
+            if (latest_input_scheduling_)
+              latest_scan_.Push(message, rclcpp::Time(message->header.stamp).nanoseconds());
+            else RegisteredScanCallback(message);
+          }, input_options);
+  rclcpp::SubscriptionOptions terrain_options;
+  rclcpp::QoS terrain_qos = rclcpp::SensorDataQoS().keep_last(1);
+  if (use_segmented_terrain_) {
+    segmented_input_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    terrain_options.callback_group = segmented_input_group_;
+    // Both adapter outputs are reliable. A small reliable history preserves
+    // their common source stamp across fragmented cloud delivery/reordering.
+    terrain_qos = rclcpp::QoS(4).reliable();
+  }
   terrain_map_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-      sub_terrain_map_topic_, rclcpp::SensorDataQoS(),
-      std::bind(&SensorCoveragePlanner3D::TerrainMapCallback, this,
-                std::placeholders::_1));
-  terrain_map_ext_sub_ =
-      this->create_subscription<sensor_msgs::msg::PointCloud2>(
-          sub_terrain_map_ext_topic_, rclcpp::SensorDataQoS(),
-          std::bind(&SensorCoveragePlanner3D::TerrainMapExtCallback, this,
-                    std::placeholders::_1));
+      sub_terrain_map_topic_, terrain_qos,
+      [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr message) {
+        if (use_segmented_terrain_) CacheSegmentedCloud(message, false);
+        else TerrainMapCallback(message);
+      }, terrain_options);
+  terrain_map_ext_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+      sub_terrain_map_ext_topic_, terrain_qos,
+      [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr message) {
+        if (use_segmented_terrain_) CacheSegmentedCloud(message, true);
+        else TerrainMapExtCallback(message);
+      }, terrain_options);
   state_estimation_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-      sub_state_estimation_topic_, rclcpp::SensorDataQoS(),
-      std::bind(&SensorCoveragePlanner3D::StateEstimationCallback, this,
-                std::placeholders::_1));
+      sub_state_estimation_topic_, rclcpp::SensorDataQoS().keep_last(1),
+      [this](nav_msgs::msg::Odometry::ConstSharedPtr message) {
+        if (latest_input_scheduling_)
+          latest_odometry_.Push(message, rclcpp::Time(message->header.stamp).nanoseconds());
+        else StateEstimationCallback(message);
+      }, input_options);
   coverage_boundary_sub_ =
       this->create_subscription<geometry_msgs::msg::PolygonStamped>(
           sub_coverage_boundary_topic_, 5,
@@ -502,6 +552,7 @@ void SensorCoveragePlanner3D::ExplorationStartCallback(
 
 void SensorCoveragePlanner3D::StateEstimationCallback(
     const nav_msgs::msg::Odometry::ConstSharedPtr state_estimation_msg) {
+  diagnostic_odom_stamp_ = rclcpp::Time(state_estimation_msg->header.stamp).seconds();
   robot_position_ = state_estimation_msg->pose.pose.position;
   // Todo: use a boolean
   if (std::abs(initial_position_.x()) < 0.01 &&
@@ -519,6 +570,7 @@ void SensorCoveragePlanner3D::StateEstimationCallback(
       .getRPY(roll, pitch, yaw);
 
   robot_yaw_ = yaw;
+  robot_orientation_ = geo_quat;
 
   if (state_estimation_msg->twist.twist.linear.x > 0.4) {
     moving_forward_ = true;
@@ -530,9 +582,12 @@ void SensorCoveragePlanner3D::StateEstimationCallback(
 
 void SensorCoveragePlanner3D::RegisteredScanCallback(
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr registered_scan_msg) {
-  if (!initialized_) {
+  if (!latest_input_scheduling_) ConsumeSegmentedClouds();
+  if (!initialized_ || !SegmentedTerrainReady()) {
     return;
   }
+  diagnostic_scan_stamp_ = rclcpp::Time(registered_scan_msg->header.stamp).seconds();
+  const auto scan_processing_start = std::chrono::steady_clock::now();
   pcl::PointCloud<pcl::PointXYZ>::Ptr registered_scan_tmp(
       new pcl::PointCloud<pcl::PointXYZ>());
   pcl::fromROSMsg(*registered_scan_msg, *registered_scan_tmp);
@@ -554,12 +609,14 @@ void SensorCoveragePlanner3D::RegisteredScanCallback(
       kKeyposeCloudDwzFilterLeafSize, kKeyposeCloudDwzFilterLeafSize);
   registered_cloud_->cloud_->clear();
   pcl::copyPointCloud(*registered_scan_tmp, *(registered_cloud_->cloud_));
+  coverage_observation_pose_.position = robot_position_;
+  coverage_observation_pose_.orientation = robot_orientation_;
 
   planning_env_->UpdateRobotPosition(robot_position_);
   planning_env_->UpdateRegisteredCloud<pcl::PointXYZI>(
       registered_cloud_->cloud_);
 
-  registered_cloud_count_ = (registered_cloud_count_ + 1) % 5;
+  registered_cloud_count_ = (registered_cloud_count_ + 1) % keypose_cloud_frames_;
   if (registered_cloud_count_ == 0) {
     // initialized_ = true;
     keypose_.pose.pose.position = robot_position_;
@@ -578,25 +635,90 @@ void SensorCoveragePlanner3D::RegisteredScanCallback(
     registered_scan_stack_->cloud_->clear();
     keypose_cloud_update_ = true;
   }
+  const double scan_processing_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - scan_processing_start).count();
+  diagnostic_scan_ms_ = scan_processing_ms;
+  if (scan_processing_ms > 500.0) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                        "Registered scan processing occupies planning group for %.1fms", scan_processing_ms);
+  }
+}
+
+void SensorCoveragePlanner3D::CacheSegmentedCloud(
+    sensor_msgs::msg::PointCloud2::ConstSharedPtr message, bool ground) {
+  if (AcceptSegmentedCloud(*message, 0.0)) segmented_cloud_buffer_.Push(std::move(message), ground);
+}
+
+void SensorCoveragePlanner3D::ConsumeSegmentedClouds() {
+  if (!use_segmented_terrain_) return;
+  auto pair = segmented_cloud_buffer_.Take();
+  if (!pair.first || !pair.second ||
+      !AcceptSegmentedCloud(*pair.first, segmented_terrain_stamp_)) return;
+  // Decode both halves before touching the active map. Calling the two legacy
+  // callbacks here would recheck the clock between commits: a frame crossing
+  // the age boundary could update obstacles but leave ground on the old stamp.
+  pcl::PointCloud<pcl::PointXYZI>::Ptr terrain(new pcl::PointCloud<pcl::PointXYZI>());
+  pcl::PointCloud<pcl::PointXYZI>::Ptr ground(new pcl::PointCloud<pcl::PointXYZI>());
+  pcl::PointCloud<pcl::PointXYZI>::Ptr obstacles(new pcl::PointCloud<pcl::PointXYZI>());
+  pcl::fromROSMsg(*pair.first, *terrain);
+  pcl::fromROSMsg(*pair.second, *ground);
+  for (const auto& point : terrain->points) {
+    if (pcl::isFinite(point) && std::isfinite(point.intensity) && point.intensity > kTerrainCollisionThreshold)
+      obstacles->push_back(point);
+  }
+  if (!AcceptSegmentedCloud(*pair.first, segmented_terrain_stamp_)) return;
+  // This whole commit is in the default mutually-exclusive planning group.
+  planning_env_->SetExternalCollisionCloud(obstacles);
+  terrain_collision_cloud_->cloud_ = obstacles;
+  large_terrain_cloud_->cloud_ = ground;
+  segmented_terrain_stamp_ = rclcpp::Time(pair.first->header.stamp).seconds();
+  segmented_ground_stamp_ = segmented_terrain_stamp_;
+}
+
+bool SensorCoveragePlanner3D::SegmentedTerrainReady() const {
+  if (!use_segmented_terrain_) return true;
+  const double age = this->now().seconds() - segmented_terrain_stamp_;
+  return segmented_terrain_stamp_ > 0 &&
+         segmented_terrain_stamp_ == segmented_ground_stamp_ &&
+         age >= -0.05 && (segmented_max_age_ == 0 || age <= segmented_max_age_);
+}
+
+bool SensorCoveragePlanner3D::AcceptSegmentedCloud(
+    const sensor_msgs::msg::PointCloud2& message, double previous_stamp) const {
+  const double stamp = rclcpp::Time(message.header.stamp).seconds();
+  const double age = this->now().seconds() - stamp;
+  return message.header.frame_id == world_frame_id_ && stamp > previous_stamp &&
+         stamp > 0 && age >= -0.05 && (segmented_max_age_ == 0 || age <= segmented_max_age_);
 }
 
 void SensorCoveragePlanner3D::TerrainMapCallback(
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr terrain_map_msg) {
-  if (kCheckTerrainCollision) {
+  if (use_segmented_terrain_ && !AcceptSegmentedCloud(*terrain_map_msg, segmented_terrain_stamp_)) return;
+  if (kCheckTerrainCollision || use_segmented_terrain_) {
     pcl::PointCloud<pcl::PointXYZI>::Ptr terrain_map_tmp(
         new pcl::PointCloud<pcl::PointXYZI>());
     pcl::fromROSMsg<pcl::PointXYZI>(*terrain_map_msg, *terrain_map_tmp);
     terrain_collision_cloud_->cloud_->clear();
     for (auto &point : terrain_map_tmp->points) {
-      if (point.intensity > kTerrainCollisionThreshold) {
-        terrain_collision_cloud_->cloud_->points.push_back(point);
+      if (pcl::isFinite(point) && std::isfinite(point.intensity) && point.intensity > kTerrainCollisionThreshold) {
+        terrain_collision_cloud_->cloud_->push_back(point);
       }
+    }
+    if (use_segmented_terrain_) {
+      planning_env_->SetExternalCollisionCloud(terrain_collision_cloud_->cloud_);
+      segmented_terrain_stamp_ = rclcpp::Time(terrain_map_msg->header.stamp).seconds();
     }
   }
 }
 
 void SensorCoveragePlanner3D::TerrainMapExtCallback(
     const sensor_msgs::msg::PointCloud2::ConstSharedPtr terrain_map_ext_msg) {
+  if (use_segmented_terrain_) {
+    if (!AcceptSegmentedCloud(*terrain_map_ext_msg, segmented_ground_stamp_)) return;
+    pcl::fromROSMsg<pcl::PointXYZI>(*terrain_map_ext_msg, *(large_terrain_cloud_->cloud_));
+    segmented_ground_stamp_ = rclcpp::Time(terrain_map_ext_msg->header.stamp).seconds();
+    return;  // This topic contains ground only, never obstacle intensity.
+  }
   if (kUseTerrainHeight) {
     pcl::fromROSMsg<pcl::PointXYZI>(*terrain_map_ext_msg,
                                     *(large_terrain_cloud_->cloud_));
@@ -743,7 +865,7 @@ void SensorCoveragePlanner3D::UpdateKeyposeGraph() {
 int SensorCoveragePlanner3D::UpdateViewPoints() {
   misc_utils_ns::Timer collision_cloud_timer("update collision cloud");
   collision_cloud_timer.Start();
-  collision_cloud_->cloud_ = planning_env_->GetCollisionCloud();
+  *collision_cloud_->cloud_ = *planning_env_->GetCollisionCloud();
   collision_cloud_timer.Stop(false);
 
   misc_utils_ns::Timer viewpoint_manager_update_timer(
@@ -753,18 +875,25 @@ int SensorCoveragePlanner3D::UpdateViewPoints() {
     viewpoint_manager_->SetViewPointHeightWithTerrain(
         large_terrain_cloud_->cloud_);
   }
-  if (kCheckTerrainCollision) {
+  if (kCheckTerrainCollision && !use_segmented_terrain_) {
     *(collision_cloud_->cloud_) += *(terrain_collision_cloud_->cloud_);
     *(collision_cloud_->cloud_) += *(terrain_ext_collision_cloud_->cloud_);
   }
   viewpoint_manager_->CheckViewPointCollision(collision_cloud_->cloud_);
   viewpoint_manager_->CheckViewPointLineOfSight();
+  viewpoint_manager_->SetRobotYaw(robot_yaw_);
   viewpoint_manager_->CheckViewPointConnectivity();
   int viewpoint_candidate_count = viewpoint_manager_->GetViewPointCandidate();
 
   UpdateVisitedPositions();
   viewpoint_manager_->UpdateViewPointVisited(visited_positions_);
   viewpoint_manager_->UpdateViewPointVisited(grid_world_);
+  if (viewpoint_manager_->UsesForwardSensor()) {
+    auto poses = viewpoint_manager_->GetCandidateObservationPoses();
+    poses.header.frame_id = world_frame_id_;
+    poses.header.stamp = now();
+    observation_poses_pub_->publish(poses);
+  }
 
   // For visualization
   collision_cloud_->Publish();
@@ -789,16 +918,22 @@ void SensorCoveragePlanner3D::UpdateViewPointCoverage() {
   robot_viewpoint_.ResetCoverage();
   geometry_msgs::msg::Pose robot_pose;
   robot_pose.position = robot_position_;
-  robot_viewpoint_.setPose(robot_pose);
+  robot_pose.orientation = robot_orientation_;
+  robot_viewpoint_.setPose(robot_viewpoint_.IsDirectional() ? coverage_observation_pose_ : robot_pose);
   UpdateRobotViewPointCoverage();
   update_coverage_timer.Stop(false);
 }
 
 void SensorCoveragePlanner3D::UpdateRobotViewPointCoverage() {
-  pcl::PointCloud<pcl::PointXYZI>::Ptr cloud =
-      planning_env_->GetCollisionCloud();
+  pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>());
+  if (robot_viewpoint_.IsDirectional())
+    pcl::copyPointCloud(*registered_cloud_->cloud_, *cloud);
+  else if (use_segmented_terrain_)
+    pcl::copyPointCloud(*planning_env_->GetStackedCloud(), *cloud);
+  else
+    cloud = planning_env_->GetCollisionCloud();
   for (const auto &point : cloud->points) {
-    if (viewpoint_manager_->InFOVAndRange(
+    if (robot_viewpoint_.IsDirectional() ? robot_viewpoint_.InSensorFOV(point) : viewpoint_manager_->InFOVAndRange(
             Eigen::Vector3d(point.x, point.y, point.z),
             Eigen::Vector3d(robot_position_.x, robot_position_.y,
                             robot_position_.z))) {
@@ -1036,6 +1171,7 @@ SensorCoveragePlanner3D::ConcatenateGlobalLocalPath(
     return full_path;
   } else {
     full_path = local_path;
+    if (local_path.nodes_.empty()) return full_path; // Let global fallback handle an empty local result.
     if (local_path.nodes_.front().type_ ==
             exploration_path_ns::NodeType::LOCAL_PATH_END &&
         local_path.nodes_.back().type_ ==
@@ -1068,6 +1204,7 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
   execution_reference_target_index_ = -1;
   execution_reference_direction_step_ = 0;
   execution_reference_uses_global_path_ = false;
+  reference_selection_reason_ = "local_path_available";
 
   // Determine which direction to follow on the global path
   double dist_from_start = 0.0;
@@ -1101,7 +1238,8 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
       break;
     }
   }
-  if (local_path.GetNodeNum() < 1 || local_path_too_short) {
+  if (local_path.GetNodeNum() < 2 || local_path_too_short) {
+    reference_selection_reason_ = local_path.GetNodeNum() < 2 ? "global_fallback_no_local_edge" : "global_fallback_short_local";
     std::vector<Eigen::Vector3d> global_positions;
     global_positions.reserve(global_path.nodes_.size());
     for (const auto &node : global_path.nodes_) {
@@ -1110,6 +1248,8 @@ bool SensorCoveragePlanner3D::GetLookAheadPoint(
     const auto selection =
         SelectGlobalExecutionReference(global_positions, kLookAheadDistance / 2,
                                        dist_from_start < dist_from_end);
+    lookahead_point = robot_position;  // No valid route: stop, never reuse a stale goal.
+    if (!selection.valid) reference_selection_reason_ += "_unavailable";
     if (selection.valid) {
       lookahead_point = global_positions[selection.target_index];
       execution_reference_robot_index_ = selection.robot_index;
@@ -1448,7 +1588,18 @@ void SensorCoveragePlanner3D::PublishExecutionReferencePath(
            << ",\"simplified_node_count\":" << simplified_node_count
            << ",\"shortcut_count\":" << shortcut_count
            << ",\"raw_turn_sum_rad\":" << raw_turn_sum
-           << ",\"simplified_turn_sum_rad\":" << simplified_turn_sum << "}";
+           << ",\"simplified_turn_sum_rad\":" << simplified_turn_sum
+           << ",\"selection_reason\":\"" << reference_selection_reason_ << "\""
+           << ",\"candidate_viewpoints\":" << diagnostic_candidates_
+           << ",\"local_nodes\":" << diagnostic_local_nodes_
+           << ",\"global_nodes\":" << diagnostic_global_nodes_
+           << ",\"target_x\":" << lookahead_point_.x()
+           << ",\"target_y\":" << lookahead_point_.y() << "}";
+    if (reason == "path_published") {
+      if (previous_reference_source_ != "none" && previous_reference_source_ != source_name)
+        ++reference_source_switches_;
+      previous_reference_source_ = source_name;
+    }
     status.data = stream.str();
     execution_reference_status_publisher_->publish(status);
   };
@@ -1557,7 +1708,7 @@ void SensorCoveragePlanner3D::PublishWaypoint() {
     double extend_dist = lookahead_point_in_line_of_sight_
                              ? kExtendWayPointDistanceBig
                              : kExtendWayPointDistanceSmall;
-    if (r < extend_dist && kExtendWayPoint) {
+    if (std::isfinite(r) && r > 1e-6 && r < extend_dist && kExtendWayPoint) {
       dx = dx / r * extend_dist;
       dy = dy / r * extend_dist;
     }
@@ -1565,6 +1716,15 @@ void SensorCoveragePlanner3D::PublishWaypoint() {
     waypoint.point.y = dy + robot_position_.y;
     waypoint.point.z = lookahead_point_.z();
   }
+  if (!std::isfinite(waypoint.point.x) || !std::isfinite(waypoint.point.y) ||
+      !std::isfinite(waypoint.point.z)) {
+    RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 2000,
+                          "Rejected non-finite waypoint");
+    return;
+  }
+  const double reference_time = now().seconds();
+  diagnostic_reference_interval_ = diagnostic_reference_stamp_ > 0 ? reference_time-diagnostic_reference_stamp_ : 0.;
+  diagnostic_reference_stamp_ = reference_time;
   misc_utils_ns::Publish(shared_from_this(), waypoint_pub_, waypoint,
                          world_frame_id_);
 }
@@ -1653,9 +1813,84 @@ void SensorCoveragePlanner3D::CountDirectionChange() {
   momentum_activation_count_pub_->publish(momentum_activation_count_msg);
 }
 
+void SensorCoveragePlanner3D::UpdateCompletionState(
+    bool ready_to_return, bool robot_in_collision, bool reference_valid) {
+  // An unavailable reference / blocked body is not evidence of completion.
+  // A genuinely completed mission at a clear home pose needs no travel edge.
+  if (ready_to_return && !robot_in_collision && (reference_valid || at_home_)) {
+    if (!exploration_finished_)
+      PrintExplorationStatus("Exploration completed, returning home", false);
+    exploration_finished_ = true;
+  }
+  if (exploration_finished_ && at_home_ && !robot_in_collision && !stopped_) {
+    PrintExplorationStatus("Return home completed", false);
+    stopped_ = true;
+  }
+}
+
+void SensorCoveragePlanner3D::PublishPlanningStatus(const std::string& reason) {
+  if (!planning_status_pub_) return;
+  const double elapsed = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now()-planning_cycle_start_).count();
+  std::ostringstream out;
+  out << "{\"reason\":\"" << reason << "\",\"cycle\":" << planning_cycle_
+      << ",\"stamp\":" << std::fixed << std::setprecision(6) << now().seconds()
+      << ",\"task_active\":" << (initialized_ && (kAutoStart || start_exploration_) && !stopped_ ? "true" : "false")
+      << ",\"cycle_ms\":" << elapsed << ",\"scan_ms\":" << diagnostic_scan_ms_
+      << ",\"planning_period_s\":" << planning_period_s_
+      << ",\"forward_sensor\":" << (robot_viewpoint_.IsDirectional() ? "true" : "false")
+      << ",\"sensor_range_m\":" << viewpoint_manager_->GetSensorRange()
+      << ",\"coverage_observation_points\":" << registered_cloud_->cloud_->size()
+      << ",\"candidate_heading_model\":\"" << (robot_viewpoint_.IsDirectional() ? "connectivity_arrival" : "legacy_omni") << "\""
+      << ",\"scan_age_s\":" << (diagnostic_scan_stamp_ > 0 ? now().seconds()-diagnostic_scan_stamp_ : -1.)
+      << ",\"odom_age_s\":" << (diagnostic_odom_stamp_ > 0 ? now().seconds()-diagnostic_odom_stamp_ : -1.)
+      << ",\"replaced_scan_count\":" << latest_scan_.Replaced()
+      << ",\"candidate_viewpoints\":" << diagnostic_candidates_
+      << ",\"uncovered_points\":" << diagnostic_uncovered_
+      << ",\"uncovered_frontiers\":" << diagnostic_frontiers_
+      << ",\"local_nodes\":" << diagnostic_local_nodes_
+      << ",\"global_nodes\":" << diagnostic_global_nodes_
+      << ",\"local_length_m\":" << diagnostic_local_length_
+      << ",\"global_length_m\":" << diagnostic_global_length_
+      << ",\"last_reference_source\":\"" << previous_reference_source_ << "\""
+      << ",\"source_switch_count\":" << reference_source_switches_
+      << ",\"reference_interval_s\":" << diagnostic_reference_interval_
+      << ",\"reference_age_s\":" << (diagnostic_reference_stamp_ > 0 ? now().seconds()-diagnostic_reference_stamp_ : -1.)
+      << ",\"robot_x\":" << robot_position_.x << ",\"robot_y\":" << robot_position_.y
+      << ",\"local_coverage_complete\":" << (local_coverage_planner_->IsLocalCoverageComplete() ? "true" : "false")
+      << ",\"last_reference_selection_valid\":" << (execution_reference_selection_valid_ ? "true" : "false")
+      << "}";
+  std_msgs::msg::String message; message.data=out.str(); planning_status_pub_->publish(message);
+}
+
 void SensorCoveragePlanner3D::execute() {
+  planning_cycle_start_ = std::chrono::steady_clock::now();
+  ++planning_cycle_;
+  diagnostic_candidates_ = diagnostic_uncovered_ = diagnostic_frontiers_ = -1;
+  diagnostic_local_nodes_ = diagnostic_global_nodes_ = 0;
+  diagnostic_local_length_ = diagnostic_global_length_ = diagnostic_scan_ms_ = 0.;
+  if (latest_input_scheduling_) {
+    auto odometry = latest_odometry_.Take();
+    if (odometry) StateEstimationCallback(odometry);
+    if (diagnostic_odom_stamp_ <= 0.) {
+      PublishPlanningStatus("waiting_odometry");
+      return;
+    }
+  }
+  ConsumeSegmentedClouds();
+  if (!SegmentedTerrainReady()) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                        "Waiting for fresh paired segmented terrain and ground clouds "
+                        "(terrain_age=%.3fs ground_age=%.3fs stamp_delta=%.6fs)",
+                        this->now().seconds() - segmented_terrain_stamp_,
+                        this->now().seconds() - segmented_ground_stamp_,
+                        segmented_terrain_stamp_ - segmented_ground_stamp_);
+    PublishPlanningStatus("waiting_segmented_terrain");
+    return;
+  }
   if (!kAutoStart && !start_exploration_) {
-    RCLCPP_INFO(this->get_logger(), "Waiting for start signal");
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *get_clock(), 5000, "Waiting for start signal");
+    PublishPlanningStatus("waiting_start");
     return;
   }
   Timer overall_processing_timer("overall processing");
@@ -1680,6 +1915,14 @@ void SensorCoveragePlanner3D::execute() {
     return;
   }
 
+  if (latest_input_scheduling_) {
+    auto scan = latest_scan_.Take();
+    if (scan) RegisteredScanCallback(scan);
+    else {
+      PublishPlanningStatus("waiting_new_scan");
+      return; // Never refresh a waypoint using repeated stale input.
+    }
+  }
   overall_processing_timer.Start();
   if (keypose_cloud_update_) {
     keypose_cloud_update_ = false;
@@ -1693,9 +1936,11 @@ void SensorCoveragePlanner3D::execute() {
     UpdateGlobalRepresentation();
 
     int viewpoint_candidate_count = UpdateViewPoints();
+    diagnostic_candidates_ = viewpoint_candidate_count;
     if (viewpoint_candidate_count == 0) {
       RCLCPP_WARN(rclcpp::get_logger("standalone_logger"),
                   "Cannot get candidate viewpoints, skipping this round");
+      PublishPlanningStatus("no_candidate_viewpoints");
       return;
     }
 
@@ -1724,32 +1969,28 @@ void SensorCoveragePlanner3D::execute() {
     LocalPlanning(uncovered_point_num, uncovered_frontier_point_num,
                   global_path, local_path);
 
+    diagnostic_uncovered_ = uncovered_point_num;
+    diagnostic_frontiers_ = uncovered_frontier_point_num;
+    diagnostic_local_nodes_ = local_path.GetNodeNum();
+    diagnostic_global_nodes_ = global_path.GetNodeNum();
+    diagnostic_local_length_ = local_path.GetLength();
+    diagnostic_global_length_ = global_path.GetLength();
     near_home_ = GetRobotToHomeDistance() < kRushHomeDist;
     at_home_ = GetRobotToHomeDistance() < kAtHomeDistThreshold;
 
     double current_time = this->now().seconds();
     double delta_time = current_time - start_time_;
 
-    if (grid_world_->IsReturningHome() &&
-        local_coverage_planner_->IsLocalCoverageComplete() &&
-        (current_time - start_time_) > 5) {
-      if (!exploration_finished_) {
-        PrintExplorationStatus("Exploration completed, returning home", false);
-      }
-      exploration_finished_ = true;
-    }
-
-    if (exploration_finished_ && at_home_ && !stopped_) {
-      PrintExplorationStatus("Return home completed", false);
-      stopped_ = true;
-    }
-
     exploration_path_ = ConcatenateGlobalLocalPath(global_path, local_path);
-
-    PublishExplorationState();
-
     lookahead_point_update_ =
         GetLookAheadPoint(exploration_path_, global_path, lookahead_point_);
+    const bool robot_in_collision = planning_env_->InCollision(
+        robot_position_.x, robot_position_.y, robot_position_.z);
+    UpdateCompletionState(grid_world_->IsReturningHome() &&
+        local_coverage_planner_->IsLocalCoverageComplete() && current_time-start_time_ > 5.,
+        robot_in_collision, execution_reference_selection_valid_);
+    PublishExplorationState();
+
     PublishExecutionReferencePath(exploration_path_, global_path);
     PublishWaypoint();
 
@@ -1765,6 +2006,9 @@ void SensorCoveragePlanner3D::execute() {
     PublishLocalPlanningVisualization(local_path);
     PublishGlobalPlanningVisualization(global_path, local_path);
     PublishRuntime();
+    PublishPlanningStatus("planned");
+  } else {
+    PublishPlanningStatus("waiting_keypose");
   }
 }
 } // namespace sensor_coverage_planner_3d_ns

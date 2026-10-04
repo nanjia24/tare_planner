@@ -50,7 +50,8 @@ LiDARModel::LiDARModel(const geometry_msgs::msg::Pose& pose)
 
 void LiDARModel::ResetCoverage()
 {
-  reset_.fill(true);
+  std::fill(reset_.begin(), reset_.end(), true);
+  std::fill(covered_voxel_.begin(), covered_voxel_.end(), 0.0f);
 }
 
 void LiDARModel::GetVisualizationCloud(pcl::PointCloud<pcl::PointXYZI>::Ptr& visualization_cloud, double resol,
@@ -63,7 +64,7 @@ void LiDARModel::GetVisualizationCloud(pcl::PointCloud<pcl::PointXYZI>::Ptr& vis
     int row_index, column_index;
     ind2sub(i, row_index, column_index);
     double phi = (column_index * kHorizontalResolution - 180) * M_PI / 180;
-    double theta = (row_index * kVerticalResolution - kVerticalAngleOffset) * M_PI / 180;
+    double theta = (row_index * kVerticalResolution - vertical_angle_offset_) * M_PI / 180;
 
     double r = covered_voxel_[i];
     if (isZero(covered_voxel_[i]) || reset_[i])
@@ -80,6 +81,7 @@ void LiDARModel::GetVisualizationCloud(pcl::PointCloud<pcl::PointXYZI>::Ptr& vis
     point.z = end_point.z;
     point.intensity = 0.0;
 
+    if (directional_ && !InSensorFOV(point)) continue;
     visualization_cloud->points.push_back(point);
     pcl::PointCloud<pcl::PointXYZI>::Ptr tmp_cloud(new pcl::PointCloud<pcl::PointXYZI>());
     misc_utils_ns::LinInterpPoints<pcl::PointXYZI>(start_point, end_point, resol, tmp_cloud);

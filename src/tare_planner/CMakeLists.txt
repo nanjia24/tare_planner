@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.5)
 project(tare_planner)
 
+# Real-time point-cloud planning is unusable with CMake's unoptimized default.
+# Preserve explicit Debug/RelWithDebInfo choices.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 # Default to C99
 if(NOT CMAKE_C_STANDARD)
   set(CMAKE_C_STANDARD 99)
@@ -149,6 +155,26 @@ install(DIRECTORY "${ORTOOLS_ROOT}/lib/" DESTINATION lib/${PROJECT_NAME}/or-tool
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_latest_planner_input test/test_latest_planner_input.cpp)
+  ament_add_gtest(test_segmented_cloud_buffer test/test_segmented_cloud_buffer.cpp)
+  ament_target_dependencies(test_segmented_cloud_buffer sensor_msgs)
+  ament_add_gtest(test_segmented_collision test/test_segmented_collision.cpp)
+  target_link_libraries(test_segmented_collision sensor_coverage_planner_ground)
+  target_compile_definitions(test_segmented_collision PRIVATE
+    TARE_TEST_PARAMETERS="${CMAKE_CURRENT_SOURCE_DIR}/test/segmented_collision.yaml")
+  ament_target_dependencies(test_segmented_collision rclcpp geometry_msgs nav_msgs sensor_msgs visualization_msgs tf2 tf2_ros tf2_geometry_msgs pcl_conversions)
+  set_tests_properties(test_segmented_collision PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=97;ROS_LOCALHOST_ONLY=1")
+  ament_add_gtest(test_global_fallback test/test_global_fallback.cpp)
+  target_link_libraries(test_global_fallback sensor_coverage_planner_ground)
+  ament_target_dependencies(test_global_fallback rclcpp geometry_msgs nav_msgs sensor_msgs visualization_msgs tf2 tf2_ros tf2_geometry_msgs pcl_conversions)
+  set_tests_properties(test_global_fallback PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=98;ROS_LOCALHOST_ONLY=1")
+  ament_add_gtest(test_forward_exploration test/test_forward_exploration.cpp)
+  target_link_libraries(test_forward_exploration sensor_coverage_planner_ground)
+  ament_target_dependencies(test_forward_exploration rclcpp geometry_msgs nav_msgs sensor_msgs visualization_msgs tf2 tf2_ros tf2_geometry_msgs pcl_conversions)
+  set_tests_properties(test_forward_exploration PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=97;ROS_LOCALHOST_ONLY=1")
+  ament_add_gtest(test_forward_sensor test/test_forward_sensor.cpp)
+  target_link_libraries(test_forward_sensor lidar_model misc_utils ${PCL_LIBRARIES})
+  ament_target_dependencies(test_forward_sensor rclcpp geometry_msgs nav_msgs sensor_msgs visualization_msgs tf2 tf2_ros tf2_geometry_msgs pcl_conversions)
   ament_add_gtest(test_collision_geometry test/test_collision_geometry.cpp)
   ament_add_gtest(
     test_execution_reference_shortcut

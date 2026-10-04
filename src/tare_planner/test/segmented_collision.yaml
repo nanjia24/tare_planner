@@ -1,0 +1,27 @@
+# Small real PlanningEnv fixture; no robot or hardware control.
+tare_planner_node:
+  ros__parameters:
+    kCollisionCloudDwzLeafSize: 0.1
+    kCoverCloudZSqueezeRatio: 2.0
+    kFrontierClusterMinSize: 10
+    kFrontierClusterTolerance: 1.0
+    kKeyposeCloudStackNum: 5
+    kMaxCellPointNum: 100000
+    kPointCloudCellHeight: 2.0
+    kPointCloudCellSize: 4.0
+    kPointCloudColNum: 9
+    kPointCloudLevelNum: 5
+    kPointCloudManagerNeighborCellNum: 1
+    kPointCloudRowNum: 9
+    kSensorRange: 12.0
+    kSurfaceCloudDwzLeafSize: 0.2
+    kUseCoverageBoundaryOnFrontier: false
+    kUseCoverageBoundaryOnObjectSurface: false
+    kUseFrontier: false
+    keypose_graph/kAddEdgeCollisionCheckPointNumThr: 1
+    keypose_graph/kAddEdgeCollisionCheckRadius: 0.4
+    rolling_occupancy_grid/resolution_x: 0.2
+    rolling_occupancy_grid/resolution_y: 0.2
+    rolling_occupancy_grid/resolution_z: 0.2
+    viewpoint_manager/number_x: 40
+    viewpoint_manager/resolution_x: 0.5

@@ -13,6 +13,9 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <algorithm>
+#include <stdexcept>
+#include <Eigen/Geometry>
 // ROS
 #include <visualization_msgs/msg/marker.hpp>
 #include <geometry_msgs/msg/point.hpp>
@@ -51,6 +54,9 @@ public:
     double dy = point.y - pose_.position.y;
     double dz = point.z - pose_.position.z;
 
+    if (directional_ && !InSensorFOV(point))
+      return;
+
     int horizontal_angle = GetHorizontalAngle(dx, dy);
     int vertical_angle = GetVerticalAngle(dz, distance_to_point);
 
@@ -60,6 +66,7 @@ public:
     for (int n = -horizontal_neighbor_num; n <= horizontal_neighbor_num; n++)
     {
       int column_index = horizontal_angle + n;
+      if (directional_ || prediction_) column_index = (column_index % kHorizontalVoxelSize + kHorizontalVoxelSize) % kHorizontalVoxelSize;
       if (!ColumnIndexInRange(column_index))
         continue;
       for (int m = -vertical_neighbor_num; m <= vertical_neighbor_num; m++)
@@ -99,6 +106,9 @@ public:
     double dy = point.y - pose_.position.y;
     double dz = point.z - pose_.position.z;
 
+    if (directional_ && !InSensorFOV(point))
+      return false;
+
     int horizontal_angle = GetHorizontalAngle(dx, dy);
     int vertical_angle = GetVerticalAngle(dz, distance_to_point);
 
@@ -108,6 +118,7 @@ public:
     for (int n = -horizontal_neighbor_num; n <= horizontal_neighbor_num; n++)
     {
       int column_index = horizontal_angle + n;
+      if (directional_ || prediction_) column_index = (column_index % kHorizontalVoxelSize + kHorizontalVoxelSize) % kHorizontalVoxelSize;
       if (!ColumnIndexInRange(column_index))
         continue;
       for (int m = -vertical_neighbor_num; m <= vertical_neighbor_num; m++)
@@ -119,7 +130,7 @@ public:
         float previous_distance_to_point = covered_voxel_[ind];
         if ((!isZero(previous_distance_to_point) &&
              distance_to_point < previous_distance_to_point + occlusion_threshold && !reset_[ind]) ||
-            reset_[ind])
+            (!directional_ && reset_[ind]))
         {
           return true;
         }
@@ -132,6 +143,57 @@ public:
    * TODO
    */
   void ResetCoverage();
+
+  // Candidate occlusion cache is azimuth-independent: changing the estimated
+  // arrival heading must not discard obstacles on the other side. The manager
+  // gates each gain query by the forward FOV. Empty bins mean potential gain,
+  // NOT measured free space, unlike ConfigureForwardSensor below.
+  void ConfigurePrediction(double vertical_deg)
+  {
+    if (!std::isfinite(vertical_deg) || vertical_deg <= 0 || vertical_deg >= 180)
+      throw std::invalid_argument("Invalid prediction vertical FOV");
+    directional_ = false;
+    prediction_ = true;
+    const int half_bins = static_cast<int>(std::ceil(vertical_deg / (2 * kVerticalResolution))) + 1;
+    vertical_voxel_size_ = 2 * half_bins + 1;
+    vertical_angle_offset_ = -(90 - half_bins * kVerticalResolution);
+    covered_voxel_.assign(kHorizontalVoxelSize * vertical_voxel_size_, 0.0f);
+    reset_.assign(covered_voxel_.size(), true);
+  }
+
+  // Measured coverage requires an actual current-frame ray in the full-pose FOV.
+  void ConfigureForwardSensor(double horizontal_deg, double vertical_deg, double range)
+  {
+    if (!std::isfinite(horizontal_deg) || horizontal_deg <= 0 || horizontal_deg > 360 ||
+        !std::isfinite(vertical_deg) || vertical_deg <= 0 || vertical_deg >= 180 ||
+        !std::isfinite(range) || range <= 0)
+      throw std::invalid_argument("Invalid forward sensor FOV/range");
+    directional_ = true;
+    prediction_ = false;
+    horizontal_half_fov_ = horizontal_deg * M_PI / 360;
+    vertical_half_fov_ = vertical_deg * M_PI / 360;
+    sensor_range_ = range;
+    vertical_voxel_size_ = 91;
+    vertical_angle_offset_ = 0;
+    covered_voxel_.assign(kHorizontalVoxelSize * vertical_voxel_size_, 0.0f);
+    reset_.assign(covered_voxel_.size(), true);
+  }
+  bool IsDirectional() const { return directional_; }
+
+  template <class PointType>
+  bool InSensorFOV(const PointType& point) const
+  {
+    Eigen::Vector3d delta(point.x - pose_.position.x, point.y - pose_.position.y,
+                          point.z - pose_.position.z);
+    const double range = delta.norm();
+    Eigen::Quaterniond q(pose_.orientation.w, pose_.orientation.x,
+                         pose_.orientation.y, pose_.orientation.z);
+    if (!delta.allFinite() || !q.coeffs().allFinite() || q.norm() < 1e-8 ||
+        range < kEpsilon || range > sensor_range_) return false;
+    const Eigen::Vector3d local = q.normalized().conjugate() * delta;
+    return std::abs(std::atan2(local.y(), local.x())) <= horizontal_half_fov_ + 1e-12 &&
+           std::abs(std::atan2(local.z(), std::hypot(local.x(), local.y()))) <= vertical_half_fov_ + 1e-12;
+  }
   /**
    * @brief Get the Visualization Cloud object
    * TODO
@@ -219,7 +281,7 @@ private:
   inline int GetVerticalAngle(double dz, double distance_to_point) const
   {
     double vertical_angle =
-        (acos(dz / distance_to_point) * kToDegreeConst + kVerticalAngleOffset) / kVerticalResolution;
+        (acos(std::max(-1.0, std::min(1.0, dz / distance_to_point))) * kToDegreeConst + vertical_angle_offset_) / kVerticalResolution;
     return static_cast<int>(round(vertical_angle));
   }
   /**
@@ -246,7 +308,7 @@ private:
   }
   inline bool RowIndexInRange(int row_index) const
   {
-    return row_index >= 0 && row_index < kVerticalVoxelSize;
+    return row_index >= 0 && row_index < vertical_voxel_size_;
   }
   inline bool ColumnIndexInRange(int column_index) const
   {
@@ -276,9 +338,16 @@ private:
   // Vertical angle offset, eg, angle [75, 105] -> indices [0, 30]
   static const int kVerticalAngleOffset = -(90 - kVerticalFOV / 2);
   // The distance that a ray can reach from the direction determined by the horizontal angle and vertical angle
-  std::array<float, kHorizontalVoxelSize * kVerticalVoxelSize> covered_voxel_;
+  std::vector<float> covered_voxel_ = std::vector<float>(kHorizontalVoxelSize * kVerticalVoxelSize, 0.0f);
   // Whether a voxel is reset
-  std::array<bool, kHorizontalVoxelSize * kVerticalVoxelSize> reset_;
+  std::vector<bool> reset_ = std::vector<bool>(kHorizontalVoxelSize * kVerticalVoxelSize, true);
+  int vertical_voxel_size_ = kVerticalVoxelSize;
+  int vertical_angle_offset_ = kVerticalAngleOffset;
+  bool directional_ = false;
+  bool prediction_ = false;
+  double horizontal_half_fov_ = M_PI;
+  double vertical_half_fov_ = M_PI / 15;
+  double sensor_range_ = 0.0;
   // Pose of the lidar model
   geometry_msgs::msg::Pose pose_;
 };

@@ -236,6 +236,19 @@ void PlanningEnv::UpdateTerrainCloud(const pcl::PointCloud<pcl::PointXYZI>::Ptr&
 
 bool PlanningEnv::InCollision(double x, double y, double z) const
 {
+  if (use_external_collision_cloud_)
+  {
+    // No segmented input is different from a received empty obstacle cloud.
+    if (!external_collision_cloud_) return true;
+    if (external_collision_cloud_->empty()) return false;
+    pcl::PointXYZI query;
+    query.x = x; query.y = y; query.z = z;
+    std::vector<int> indices;
+    std::vector<float> distances;
+    external_collision_kdtree_.radiusSearch(query, parameters_.kKeyposeGraphCollisionCheckRadius,
+                                            indices, distances);
+    return static_cast<int>(indices.size()) > parameters_.kKeyposeGraphCollisionCheckPointNumThr;
+  }
   if (stacked_cloud_->cloud_->points.empty())
   {
     RCLCPP_WARN(rclcpp::get_logger("standalone_logger"),
@@ -284,6 +297,16 @@ void PlanningEnv::UpdateCoveredArea(const lidar_model_ns::LiDARModel& robot_view
     if (point.g > 0)
     {
       planner_cloud_->cloud_->points[i].g = 255;
+      continue;
+    }
+    if (robot_viewpoint.IsDirectional())
+    {
+      if (robot_viewpoint.CheckVisibility(point, coverage_occlusion_thr))
+      {
+        planner_cloud_->cloud_->points[i].g = 255;
+        covered_point_indices.push_back(i);
+      }
+      // Visiting a position does not imply observing all headings there.
       continue;
     }
     if (std::abs(point.z - robot_position.z) < diff_z_max)
@@ -336,7 +359,9 @@ void PlanningEnv::UpdateCoveredArea(const lidar_model_ns::LiDARModel& robot_view
       for (const auto& idx : nearby_indices)
       {
         MY_ASSERT(idx >= 0 && idx < planner_cloud_->cloud_->points.size());
-        planner_cloud_->cloud_->points[idx].g = 255;
+        if (!robot_viewpoint.IsDirectional() ||
+            robot_viewpoint.CheckVisibility(planner_cloud_->cloud_->points[idx], coverage_occlusion_thr))
+          planner_cloud_->cloud_->points[idx].g = 255;
       }
     }
   }

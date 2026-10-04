@@ -58,6 +58,7 @@ public:
   {
     return lidar_model_.getPosition();
   }
+  void ConfigurePrediction(double vertical_deg) { lidar_model_.ConfigurePrediction(vertical_deg); }
   void ResetCoverage();
   void Reset();
 
